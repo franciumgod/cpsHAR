@@ -3,15 +3,14 @@ import gc
 
 import numpy as np
 from utils.utils import (
-    calculate_mcc_multilabel,
     plot_per_class_confusion,
     evaluate_and_print_multilabel_metrics,
+    plot_confusion_and_timeline,
 )
 from utils.config import Config
 from data_handler import DataHandler
 from models.RF import RandomForestClassifierSK
-from utils.utils import calculate_mcc_multilabel, plot_per_class_confusion
-from models.XGB import XGBClassifier, XGBoostClassifierSK
+from models.XGB import XGBoostClassifierSK
 
 if __name__ == '__main__':
 
@@ -39,6 +38,9 @@ if __name__ == '__main__':
     macro_f1s = []
     macro_pr_aucs = []
     macro_briers = []
+    all_true = []
+    all_pred = []
+    all_test_x = []
 
     lr_histories_by_fold = {}
 
@@ -57,9 +59,9 @@ if __name__ == '__main__':
         train, val, test, target_vals = datahandler.get_data_loaders()
 
         # just to get an insight into the data
-        #plot_class_distribution(train[1], target_vals)
-        #plot_class_distribution(val[1], target_vals)
-        #plot_class_distribution(test[1], target_vals)
+        plot_per_class_confusion(train[1], target_vals)
+        plot_per_class_confusion(val[1], target_vals)
+        plot_per_class_confusion(test[1], target_vals)
 
         try:
 
@@ -69,11 +71,7 @@ if __name__ == '__main__':
             model = XGBoostClassifierSK(target_vals)
             # model = MyAwesomeModel(...)
 
-            # Here, we use the validation set to follow good machine learning practice, which is particularly relevant for evaluation during training.
-            # However, the validation data can also be incorporated directly into the model training if necessary.
             print("Training model...")
-            # Note: Any kind of preprocessing, data augmentation or feature engineering should be done within the model.train() function
-            # so it's capsuled within the model class (see RandomForestClassifierSK for an example)
             model.train(train, val)
             print("Evaluating model...")
             predicted_y = model.predict(test[0])
@@ -93,6 +91,20 @@ if __name__ == '__main__':
             macro_pr_aucs.append(fold_metrics["macro_pr_auc"])
             macro_briers.append(fold_metrics["macro_brier"])
 
+            plot_paths = plot_confusion_and_timeline(
+                y_true=test[1],
+                y_pred=predicted_y,
+                class_names=target_vals,
+                fold_label=f"fold_{fold}",
+                X_for_timeline=test[0],
+                save_dir="outputs/plots",
+            )
+            print(f"Saved fold plots: {plot_paths['confusion_path']} | {plot_paths['timeline_path']}")
+
+            all_true.append(test[1])
+            all_pred.append(predicted_y)
+            all_test_x.append(test[0])
+
             # optional, for more insight, plot the per-class-confusion-matrix for the test set
             # plot_per_class_confusion(test[1], predicted_y, target_vals)
 
@@ -101,7 +113,7 @@ if __name__ == '__main__':
             # Since we average over classes, it can happen that some classes have a
             # negative MCC while others have a positive MCC, resulting that scores balance each other out
             # Check your individual scores to see if they are reasonable
-            test_mcc = calculate_mcc_multilabel(predicted_y, test[1])
+            test_mcc = fold_metrics["macro_mcc"]
             test_mccs.append(test_mcc)
 
 
@@ -114,6 +126,24 @@ if __name__ == '__main__':
         print("--- End of Fold ---")
 
     avg_mcc = sum(test_mccs) / len(test_mccs)
+
+    if all_true and all_pred:
+        overall_true = np.concatenate(all_true, axis=0)
+        overall_pred = np.concatenate(all_pred, axis=0)
+        overall_x = np.concatenate(all_test_x, axis=0) if all_test_x else None
+        overall_plot_paths = plot_confusion_and_timeline(
+            y_true=overall_true,
+            y_pred=overall_pred,
+            class_names=target_vals,
+            fold_label="overall",
+            X_for_timeline=overall_x,
+            save_dir="outputs/plots",
+        )
+        print(
+            f"Saved overall plots: "
+            f"{overall_plot_paths['confusion_path']} | {overall_plot_paths['timeline_path']}"
+        )
+
     print("Scores for each run: ", test_mccs)
     print(f"Macro-F1 per fold: {macro_f1s} | avg={np.mean(macro_f1s):.4f}")
     print(f"Macro PR-AUC per fold: {macro_pr_aucs} | avg={np.nanmean(macro_pr_aucs):.4f}")

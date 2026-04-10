@@ -1,6 +1,8 @@
 import matplotlib.pyplot as plt
 import seaborn as sns
 import numpy as np
+from pathlib import Path
+from sklearn.metrics import confusion_matrix
 from sklearn.metrics import matthews_corrcoef, multilabel_confusion_matrix
 from sklearn.metrics import (
     matthews_corrcoef,
@@ -89,6 +91,7 @@ def _normalize_multilabel_proba(y_prob):
 def evaluate_and_print_multilabel_metrics(y_true, y_pred, y_prob, class_names, fold_idx, split_name="Test"):
     """
     Prints:
+    - Macro-MCC
     - Macro-F1
     - Macro PR-AUC
     - Macro Brier Score
@@ -115,6 +118,7 @@ def evaluate_and_print_multilabel_metrics(y_true, y_pred, y_prob, class_names, f
         y_p = y_pred[:, i]
         y_s = y_prob[:, i]
 
+        mcc_i = matthews_corrcoef(y_t, y_p)
         f1_i = f1_score(y_t, y_p, zero_division=0)
         rec_i = recall_score(y_t, y_p, zero_division=0)
 
@@ -129,6 +133,7 @@ def evaluate_and_print_multilabel_metrics(y_true, y_pred, y_prob, class_names, f
         per_class.append(
             {
                 "name": class_names[i] if i < len(class_names) else f"class_{i}",
+                "mcc": mcc_i,
                 "f1": f1_i,
                 "recall": rec_i,
                 "pr_auc": pr_auc_i,
@@ -136,6 +141,7 @@ def evaluate_and_print_multilabel_metrics(y_true, y_pred, y_prob, class_names, f
             }
         )
 
+    macro_mcc = float(calculate_mcc_multilabel(y_true, y_pred))
     macro_f1 = float(np.mean([x["f1"] for x in per_class]))
     macro_recall = float(np.mean([x["recall"] for x in per_class]))
     macro_pr_auc = float(np.nanmean([x["pr_auc"] for x in per_class]))
@@ -143,17 +149,19 @@ def evaluate_and_print_multilabel_metrics(y_true, y_pred, y_prob, class_names, f
 
     print(f"\n[{split_name}] Fold {fold_idx} metrics")
     print(
+        f"Macro-MCC={macro_mcc:.4f} | "
         f"Macro-F1={macro_f1:.4f} | "
         f"Macro-Recall={macro_recall:.4f} | "
         f"Macro PR-AUC={macro_pr_auc:.4f} | "
         f"Macro Brier={macro_brier:.4f}"
     )
     print("Per-class metrics:")
-    print(f"{'Class':20s} {'Recall':>8s} {'F1':>8s} {'PR-AUC':>8s} {'Brier':>8s}")
+    print(f"{'Class':20s} {'MCC':>8s} {'Recall':>8s} {'F1':>8s} {'PR-AUC':>8s} {'Brier':>8s}")
     for row in per_class:
         pr_auc_txt = f"{row['pr_auc']:.4f}" if not np.isnan(row["pr_auc"]) else "nan"
         print(
             f"{row['name'][:20]:20s} "
+            f"{row['mcc']:8.4f} "
             f"{row['recall']:8.4f} "
             f"{row['f1']:8.4f} "
             f"{pr_auc_txt:>8s} "
@@ -161,9 +169,125 @@ def evaluate_and_print_multilabel_metrics(y_true, y_pred, y_prob, class_names, f
         )
 
     return {
+        "macro_mcc": macro_mcc,
         "macro_f1": macro_f1,
         "macro_recall": macro_recall,
         "macro_pr_auc": macro_pr_auc,
         "macro_brier": macro_brier,
         "per_class": per_class,
     }
+
+
+def _multilabel_to_single_index(y):
+    y = np.asarray(y)
+    if y.ndim == 1:
+        return y.astype(int)
+    return np.argmax(y, axis=1).astype(int)
+
+
+def _extract_plot_signal_from_windows(X):
+    X = np.asarray(X)
+    if X.ndim != 3:
+        return np.arange(len(X)), np.asarray(X).reshape(-1)
+
+    # Support both (n, time, ch) and (n, ch, time)
+    if X.shape[1] >= X.shape[2]:
+        # (n, time, ch): use last timestep of first channel
+        signal = X[:, -1, 0]
+    else:
+        # (n, ch, time): use first channel last timestep
+        signal = X[:, 0, -1]
+
+    t = np.arange(len(signal))
+    return t, signal
+
+
+def plot_confusion_and_timeline(
+    y_true,
+    y_pred,
+    class_names,
+    fold_label,
+    X_for_timeline=None,
+    save_dir="outputs/plots",
+    max_timeline_points=8000,
+):
+    save_path = Path(save_dir)
+    save_path.mkdir(parents=True, exist_ok=True)
+
+    y_true_idx = _multilabel_to_single_index(y_true)
+    y_pred_idx = _multilabel_to_single_index(y_pred)
+    n_classes = len(class_names)
+    labels = list(range(n_classes))
+
+    cm = confusion_matrix(y_true_idx, y_pred_idx, labels=labels)
+    row_sums = cm.sum(axis=1, keepdims=True)
+    cm_norm = np.divide(cm, row_sums, out=np.zeros_like(cm, dtype=float), where=row_sums != 0)
+
+    fig_cm, ax_cm = plt.subplots(figsize=(9, 7))
+    sns.heatmap(
+        cm_norm,
+        annot=True,
+        fmt=".2f",
+        cmap="Blues",
+        vmin=0.0,
+        vmax=1.0,
+        xticklabels=class_names,
+        yticklabels=class_names,
+        ax=ax_cm,
+    )
+    ax_cm.set_xlabel("Predicted class")
+    ax_cm.set_ylabel("True class")
+    ax_cm.set_title(f"Normalized Confusion Matrix ({fold_label})")
+    plt.tight_layout()
+    cm_file = save_path / f"confusion_{fold_label}.png"
+    fig_cm.savefig(cm_file, dpi=150)
+    plt.close(fig_cm)
+
+    # Timeline style plot (true vs predicted)
+    if X_for_timeline is None:
+        t = np.arange(len(y_true_idx))
+        signal = np.zeros_like(t, dtype=float)
+    else:
+        t, signal = _extract_plot_signal_from_windows(X_for_timeline)
+
+    n = min(len(t), len(y_true_idx), len(y_pred_idx))
+    t = t[:n]
+    signal = signal[:n]
+    y_true_idx = y_true_idx[:n]
+    y_pred_idx = y_pred_idx[:n]
+
+    if n > max_timeline_points:
+        idx = np.linspace(0, n - 1, max_timeline_points, dtype=int)
+        t = t[idx]
+        signal = signal[idx]
+        y_true_idx = y_true_idx[idx]
+        y_pred_idx = y_pred_idx[idx]
+
+    cmap = plt.get_cmap("tab10", max(10, n_classes))
+    class_colors = [cmap(i) for i in range(n_classes)]
+
+    fig_tl, axes = plt.subplots(2, 1, figsize=(14, 7), sharex=True)
+    for cls in range(n_classes):
+        m_true = y_true_idx == cls
+        m_pred = y_pred_idx == cls
+        if np.any(m_true):
+            axes[0].scatter(t[m_true], signal[m_true], s=4, color=class_colors[cls], label=class_names[cls], alpha=0.9)
+        if np.any(m_pred):
+            axes[1].scatter(t[m_pred], signal[m_pred], s=4, color=class_colors[cls], label=class_names[cls], alpha=0.9)
+
+    axes[0].set_title(f"TRUE class timeline ({fold_label})")
+    axes[1].set_title(f"PREDICTED class timeline ({fold_label})")
+    axes[0].set_ylabel("Signal")
+    axes[1].set_ylabel("Signal")
+    axes[1].set_xlabel("Sample index")
+
+    handles, labels_text = axes[1].get_legend_handles_labels()
+    uniq = dict(zip(labels_text, handles))
+    axes[1].legend(uniq.values(), uniq.keys(), loc="upper right", fontsize=8)
+
+    plt.tight_layout()
+    tl_file = save_path / f"timeline_{fold_label}.png"
+    fig_tl.savefig(tl_file, dpi=150)
+    plt.close(fig_tl)
+
+    return {"confusion_path": str(cm_file), "timeline_path": str(tl_file)}
