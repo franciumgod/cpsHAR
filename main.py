@@ -1,6 +1,6 @@
 import random
 import gc
-
+import argparse
 import numpy as np
 from utils.utils import (
     plot_per_class_confusion,
@@ -12,8 +12,10 @@ from data_handler import DataHandler
 from models.RF import RandomForestClassifierSK
 from models.XGB import XGBoostClassifierSK
 
-if __name__ == '__main__':
 
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument("")
     config = Config()
 
     # Seeding
@@ -29,12 +31,6 @@ if __name__ == '__main__':
 
     ###########################################################
     # 新增一些指标，多角度检查模型性能，后续可作为模型优化的综合指标
-    # val_marco_f1s = []
-    # test_marco_f1s = []
-    # val_macro_pr_aucs = []
-    # test_macro_pr_aucs = []
-    # val_macro_briers = []
-    # test_macro_briers = []
     macro_f1s = []
     macro_pr_aucs = []
     macro_briers = []
@@ -57,11 +53,6 @@ if __name__ == '__main__':
         datahandler.config.data.validation_experiment_id = val_id
 
         train, val, test, target_vals = datahandler.get_data_loaders()
-
-        # just to get an insight into the data
-        plot_per_class_confusion(train[1], target_vals)
-        plot_per_class_confusion(val[1], target_vals)
-        plot_per_class_confusion(test[1], target_vals)
 
         try:
 

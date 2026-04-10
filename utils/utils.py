@@ -208,8 +208,9 @@ def plot_confusion_and_timeline(
     class_names,
     fold_label,
     X_for_timeline=None,
-    save_dir="outputs/plots",
+    save_dir="outputs/train_100W_without_val",
     max_timeline_points=8000,
+    show_plots=True,
 ):
     save_path = Path(save_dir)
     save_path.mkdir(parents=True, exist_ok=True)
@@ -241,6 +242,8 @@ def plot_confusion_and_timeline(
     plt.tight_layout()
     cm_file = save_path / f"confusion_{fold_label}.png"
     fig_cm.savefig(cm_file, dpi=150)
+    if show_plots:
+        plt.show()
     plt.close(fig_cm)
 
     # Timeline style plot (true vs predicted)
@@ -288,6 +291,8 @@ def plot_confusion_and_timeline(
     plt.tight_layout()
     tl_file = save_path / f"timeline_{fold_label}.png"
     fig_tl.savefig(tl_file, dpi=150)
+    if show_plots:
+        plt.show()
     plt.close(fig_tl)
 
     return {"confusion_path": str(cm_file), "timeline_path": str(tl_file)}

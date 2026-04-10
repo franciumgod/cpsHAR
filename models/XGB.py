@@ -7,7 +7,7 @@ class XGBoostClassifierSK:
     def __init__(
         self,
         classes,
-        use_val_in_train=True,
+        use_val_in_train=False,
         use_gpu=False,
         random_state=42,
         n_estimators=2000,
@@ -19,8 +19,8 @@ class XGBoostClassifierSK:
         reg_alpha=0.0,
         reg_lambda=1.0,
         early_stopping_rounds=100,
-        n_train_data_samples=1000000,
-        feature_batch_size=200000,
+        n_train_data_samples=100000,
+        feature_batch_size=20000,
     ):
         self.classes = classes
         self.use_val_in_train = use_val_in_train
