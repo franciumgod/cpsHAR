@@ -1,6 +1,11 @@
 ## main pipeline
 - [ ] train with or without val
 - [ ] numbers or training samples
+- [ ] before and after percentage of each activity
+- [ ] think about how to get a better visualization
+- [ ] choose each activity sample
+- [ ] analyse multi-label sample's percentage and each are predicted to which activity
+- [ ] model best params(first max_depth, then )
 - [ ] LightGBM
 - [ ] sliding window downsampling 
 - [ ] data augmentation

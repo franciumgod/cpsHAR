@@ -40,7 +40,8 @@ class DataConfig:
 @dataclass
 class PreprocessingConfig:
     original_freq: int = 2000
-    target_freq: int = 80
+    # target_freq: int = 2000
+    target_freq = 100
     seq_len_multiplier: float = 2
     filter_order: int = 8
     is_without_ds: bool = False
