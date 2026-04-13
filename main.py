@@ -1,5 +1,6 @@
 import random
 import gc
+import sys
 import numpy as np
 from utils.utils import (
     evaluate_and_print_multilabel_metrics,
@@ -9,6 +10,24 @@ from utils.config import Config
 from data_handler import DataHandler
 from models.XGB import XGBoostClassifierSK
 from models.LGBM import LightGBMClassifierSK
+import warnings
+warnings.filterwarnings("ignore")
+
+
+def resolve_dataset_file(data_arg):
+    if data_arg is None:
+        return "cps_data_multi_label.pkl"
+
+    text = str(data_arg).strip().lower()
+    if text in {"", "raw", "origin", "original", "none"}:
+        return "cps_data_multi_label.pkl"
+
+    if text.isdigit():
+        step = int(text)
+        return f"cps_windows_2s_2000hz_step_{step}.pkl"
+
+    return str(data_arg).strip()
+
 
 def parse_bool_arg(value, default=False):
     if value is None:
@@ -21,6 +40,27 @@ def parse_bool_arg(value, default=False):
         return True
     if text in {"0", "false", "no", "n", "off"}:
         return False
+    return default
+
+
+def detect_preprocess_order(argv_tokens):
+    subsample_flags = {"--subsample_method", "--train_sample_num"}
+    downsample_flag = "--downsample_method"
+
+    subsample_pos = min(
+        [idx for idx, token in enumerate(argv_tokens) if token in subsample_flags],
+        default=None,
+    )
+    downsample_pos = next(
+        (idx for idx, token in enumerate(argv_tokens) if token == downsample_flag),
+        None,
+    )
+
+    if subsample_pos is not None and downsample_pos is not None:
+        if subsample_pos < downsample_pos:
+            return "subsample_first"
+        return "downsample_first"
+    return "downsample_first"
 
 
 def parse_fold_list(text):
@@ -34,8 +74,9 @@ def parse_fold_list(text):
         fold_ids.append(value)
     return fold_ids
 
-def build_model(args, target_vals):
+def build_model(args, target_vals, config, preprocess_order):
     model_name = str(args.model).lower() if args.model else "xgboost"
+    model_downsample_method = args.downsample_method if preprocess_order == "subsample_first" else "false"
 
     if model_name == "xgboost":
         return XGBoostClassifierSK(
@@ -46,6 +87,8 @@ def build_model(args, target_vals):
             n_train_data_samples=args.train_sample_num,
             max_depth=getattr(args, "max_depth", 6),
             colsample_bytree=getattr(args, "colsample_bytree", 0.8),
+            pre_downsample_method=model_downsample_method,
+            pre_downsample_factor=config.prep.ds_factor,
         )
 
     if model_name == "lightgbm":
@@ -69,7 +112,10 @@ def build_model(args, target_vals):
             min_child_samples=getattr(args, "min_child_samples", 30),
             min_data_in_leaf=getattr(args, "min_data_in_leaf", 10),
             feature_batch_size=getattr(args, "feature_batch_size", 2000),
+            pre_downsample_method=model_downsample_method,
+            pre_downsample_factor=config.prep.ds_factor,
         )
+
 
 if __name__ == '__main__':
     import argparse
@@ -78,6 +124,11 @@ if __name__ == '__main__':
         description="Training and evaluation pipeline for multi-label activity recognition."
     )
 
+    parser.add_argument(
+        "--data",
+        default="raw",
+        help="Dataset selector: raw (default), or a step number like 100/200/400/500, or a custom filename under data/."
+    )
     parser.add_argument(
         "--output",
         default="output/plot",
@@ -96,7 +147,7 @@ if __name__ == '__main__':
     )
     parser.add_argument(
         "--subsample_method",
-        default="random",
+        default="interval",
         help="Strategy for subsampling training data:\n"
              "  - False    : Use all available windows without subsampling.\n"
              "  - random   : Randomly select samples from the training set (or combined train/val if --train_with_val=True).\n"
@@ -104,7 +155,7 @@ if __name__ == '__main__':
     )
     parser.add_argument(
         "--downsample_method",
-        default="false",
+        default="sliding_window",
         help="Strategy for reducing the raw 2000Hz signal:\n"
              "  - False           : Keep original data at 2000Hz (no downsampling applied).\n"
              "  - interval        : Simple decimation. Selects every N-th sample to achieve the target sampling rate.\n"
@@ -128,7 +179,7 @@ if __name__ == '__main__':
     )
     parser.add_argument(
         "--show_images",
-        default=True,
+        default=False,
         help="Drawing picture while saving."
     )
     parser.add_argument(
@@ -246,6 +297,10 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
     config = Config()
+    config.data.dataset_file = resolve_dataset_file(args.data)
+    show_images = parse_bool_arg(args.show_images, default=False)
+    preprocess_order = detect_preprocess_order(sys.argv[1:])
+    print(f"Preprocess order: {preprocess_order}")
 
     SEED = 42
     random.seed(SEED)
@@ -264,7 +319,10 @@ if __name__ == '__main__':
     lr_histories_by_fold = {}
 
     # load data
-    datahandler = DataHandler(config=config, downsample_method=args.downsample_method)
+    datahandler_downsample_method = (
+        args.downsample_method if preprocess_order == "downsample_first" else "false"
+    )
+    datahandler = DataHandler(config=config, downsample_method=datahandler_downsample_method)
 
     # Leave-one-out: EXPERIMENT_ID = 1..4
     for fold_idx, fold in enumerate(fold_ids, start=1):
@@ -278,7 +336,7 @@ if __name__ == '__main__':
 
         try:
 
-            model = build_model(args, target_vals)
+            model = build_model(args, target_vals, config, preprocess_order)
             print("Training model...")
             model.train(train, val)
             print("Evaluating model...")
@@ -306,6 +364,7 @@ if __name__ == '__main__':
                 fold_label=f"fold_{fold}",
                 X_for_timeline=test[0],
                 save_dir=args.output,
+                show_plots=show_images,
             )
             print(f"Saved fold plots: {plot_paths['confusion_path']} | {plot_paths['timeline_path']}")
 
@@ -313,14 +372,6 @@ if __name__ == '__main__':
             all_pred.append(predicted_y)
             all_test_x.append(test[0])
 
-            # optional, for more insight, plot the per-class-confusion-matrix for the test set
-            # plot_per_class_confusion(test[1], predicted_y, target_vals)
-
-            # Note: The MCC might be negative for a fold since its a correlation coefficient -> Range -1 to +1
-            # +1 indicates perfect correlation, 0 indicates no correlation, and -1 indicates perfect inverse correlation.
-            # Since we average over classes, it can happen that some classes have a
-            # negative MCC while others have a positive MCC, resulting that scores balance each other out
-            # Check your individual scores to see if they are reasonable
             test_mcc = fold_metrics["macro_mcc"]
             test_mccs.append(test_mcc)
 
@@ -346,6 +397,7 @@ if __name__ == '__main__':
             fold_label="overall",
             X_for_timeline=overall_x,
             save_dir=args.output,
+            show_plots=show_images,
         )
         print(
             f"Saved overall plots: "

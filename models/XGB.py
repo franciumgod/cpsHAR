@@ -1,6 +1,7 @@
 import numpy as np
 from xgboost import XGBClassifier
 import gc
+from numpy.lib._stride_tricks_impl import sliding_window_view
 
 
 class XGBoostClassifierSK:
@@ -22,6 +23,10 @@ class XGBoostClassifierSK:
         early_stopping_rounds=100,
         n_train_data_samples=100000,
         feature_batch_size=2000,
+        pre_downsample_method="false",
+        pre_downsample_factor=1,
+        pre_downsample_window_size=40,
+        pre_downsample_window_step=20,
     ):
         self.classes = classes
         self.use_val_in_train = use_val_in_train
@@ -30,6 +35,12 @@ class XGBoostClassifierSK:
         self.early_stopping_rounds = early_stopping_rounds
         self._n_train_data_samples = n_train_data_samples
         self._feature_batch_size = feature_batch_size
+        self.pre_downsample_method = (
+            str(pre_downsample_method).lower() if pre_downsample_method is not None else "false"
+        )
+        self.pre_downsample_factor = max(1, int(pre_downsample_factor))
+        self.pre_downsample_window_size = int(pre_downsample_window_size)
+        self.pre_downsample_window_step = int(pre_downsample_window_step)
 
         self._model_params = {
             "n_estimators": n_estimators,
@@ -48,6 +59,43 @@ class XGBoostClassifierSK:
             "eval_metric": "logloss",
         }
         self.models = []
+
+    def _maybe_downsample_windows(self, X):
+        method = self.pre_downsample_method
+        if method in {"false", "none", "0"}:
+            return np.asarray(X, dtype=np.float32)
+
+        X = np.asarray(X, dtype=np.float32)
+        if X.ndim != 3:
+            raise ValueError(f"Expected 3D input for downsampling, but got shape {X.shape}")
+
+        # normalize to (n_samples, time_steps, n_channels)
+        transposed_input = False
+        if X.shape[1] < X.shape[2]:
+            X = np.transpose(X, (0, 2, 1))
+            transposed_input = True
+
+        if method == "interval":
+            X_ds = X[:, ::self.pre_downsample_factor, :]
+        elif method == "sliding_window":
+            win = self.pre_downsample_window_size
+            step = self.pre_downsample_window_step
+            if X.shape[1] < win:
+                raise ValueError(
+                    f"Window length {X.shape[1]} is smaller than downsample window {win}."
+                )
+            windows = sliding_window_view(X, window_shape=win, axis=1)
+            windows = windows[:, ::step, :, :]
+            X_ds = windows.mean(axis=-1, dtype=np.float32)
+        else:
+            raise ValueError(
+                f"Unsupported pre_downsample_method='{self.pre_downsample_method}'. "
+                "Expected one of: false, interval, sliding_window."
+            )
+
+        if transposed_input:
+            X_ds = np.transpose(X_ds, (0, 2, 1))
+        return X_ds.astype(np.float32, copy=False)
 
     def _extract_features(self, X):
         """
@@ -119,6 +167,7 @@ class XGBoostClassifierSK:
             base_X = np.concatenate([train_X, val_X], axis=0)
             base_y = np.concatenate([train_y, val_y], axis=0)
             sampled_X, sampled_y = self._subsample_train_data(base_X, base_y)
+            sampled_X = self._maybe_downsample_windows(sampled_X)
             X_fit_feat = self._extract_features_batched(sampled_X)
             y_fit_2d = np.asarray(sampled_y)
             if y_fit_2d.ndim == 1:
@@ -127,6 +176,7 @@ class XGBoostClassifierSK:
             del base_X, base_y, sampled_X, sampled_y
         else:
             sampled_X, sampled_y = self._subsample_train_data(train_X, train_y)
+            sampled_X = self._maybe_downsample_windows(sampled_X)
             X_fit_feat = self._extract_features_batched(sampled_X)
             y_fit_2d = np.asarray(sampled_y)
             if y_fit_2d.ndim == 1:
@@ -153,6 +203,7 @@ class XGBoostClassifierSK:
         print("Training done.")
 
     def predict(self, test_X):
+        test_X = self._maybe_downsample_windows(test_X)
         X_features = self._extract_features(test_X)
         if not self.models:
             raise RuntimeError("Model has not been trained yet.")
@@ -162,6 +213,7 @@ class XGBoostClassifierSK:
         return predictions
 
     def predict_proba(self, test_X):
+        test_X = self._maybe_downsample_windows(test_X)
         X_features = self._extract_features(test_X)
         if not self.models:
             raise RuntimeError("Model has not been trained yet.")

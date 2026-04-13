@@ -6,6 +6,7 @@ from typing import List, Dict
 @dataclass
 class DataConfig:
     dataset_file: str = f"cps_data_multi_label.pkl"
+    raw_dataset_file: str = f"cps_data_multi_label.pkl"
     sensor_cols: List[str] = field(default_factory=lambda: [
         "Acc.x", "Acc.y", "Acc.z", "Gyro.x", "Gyro.y", "Gyro.z", "Baro.x","Acc.norm","Gyro.norm"
     ])
