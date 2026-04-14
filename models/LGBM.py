@@ -1,6 +1,7 @@
 import gc
 import numpy as np
 from lightgbm import LGBMClassifier
+from numpy.lib._stride_tricks_impl import sliding_window_view
 
 
 class LightGBMClassifierSK:
@@ -18,16 +19,21 @@ class LightGBMClassifierSK:
         num_leaves=63,
         subsample=0.8,
         colsample_bytree=0.8,
-        verbose=-1,
         reg_alpha=0.0,
         reg_lambda=0.0,
         drop_rate=0.1,
         max_drop=None,
         skip_drop=None,
-        n_train_data_samples=100000,
+        n_train_data_samples=100_000,
         feature_batch_size=2000,
         min_child_samples=30,
         min_data_in_leaf=10,
+        pre_downsample_method="false",
+        pre_downsample_factor=1,
+        pre_downsample_window_size=40,
+        pre_downsample_window_step=20,
+        signal_combo_map=None,
+        feature_engineering=False,
     ):
         self.classes = classes
         self.use_val_in_train = use_val_in_train
@@ -35,6 +41,20 @@ class LightGBMClassifierSK:
         self.random_state = random_state
         self._n_train_data_samples = n_train_data_samples
         self._feature_batch_size = feature_batch_size
+        self.pre_downsample_method = (
+            str(pre_downsample_method).lower() if pre_downsample_method is not None else "false"
+        )
+        self.pre_downsample_factor = max(1, int(pre_downsample_factor))
+        self.pre_downsample_window_size = int(pre_downsample_window_size)
+        self.pre_downsample_window_step = int(pre_downsample_window_step)
+        self.signal_combo_map = signal_combo_map or {}
+        self.feature_engineering = str(feature_engineering).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        }
         normalized_boosting_type = str(boosting_type).lower()
         if normalized_boosting_type == "lgbt":
             normalized_boosting_type = "gbdt"
@@ -69,8 +89,52 @@ class LightGBMClassifierSK:
         self.models = []
         self._estimator_cls = LGBMClassifier
 
+    def _select_windows_for_label(self, X, label_idx):
+        if not self.signal_combo_map:
+            return X
+        class_name = self.classes[label_idx] if label_idx < len(self.classes) else None
+        idxs = self.signal_combo_map.get(class_name)
+        if not idxs:
+            return X
+        return X[:, :, idxs]
+
+    def _maybe_downsample_windows(self, X):
+        method = self.pre_downsample_method
+        if method in {"false", "none", "0"}:
+            return np.asarray(X, dtype=np.float32)
+
+        X = np.asarray(X, dtype=np.float32)
+        if X.ndim != 3:
+            return X
+
+        transposed_input = False
+        if X.shape[1] < X.shape[2]:
+            X = np.transpose(X, (0, 2, 1))
+            transposed_input = True
+
+        if method == "interval":
+            X_ds = X[:, ::self.pre_downsample_factor, :]
+        elif method == "sliding_window":
+            win = self.pre_downsample_window_size
+            step = self.pre_downsample_window_step
+            if X.shape[1] < win:
+                X_ds = X
+            else:
+                windows = sliding_window_view(X, window_shape=win, axis=1)
+                windows = windows[:, ::step, :, :]
+                X_ds = windows.mean(axis=-1, dtype=np.float32)
+        else:
+            X_ds = X
+
+        if transposed_input:
+            X_ds = np.transpose(X_ds, (0, 2, 1))
+        return X_ds.astype(np.float32, copy=False)
+
     def _extract_features(self, X):
         X = np.asarray(X, dtype=np.float32)
+
+        if X.ndim != 3:
+            return np.asarray(X, dtype=np.float32)
 
         if X.shape[1] < X.shape[2]:
             X = np.transpose(X, (0, 2, 1))
@@ -80,7 +144,27 @@ class LightGBMClassifierSK:
         max_val = np.max(X, axis=1)
         min_val = np.min(X, axis=1)
 
-        return np.hstack([mean, std, max_val, min_val]).astype(np.float32)
+        feat_blocks = [mean, std, max_val, min_val]
+        if self.feature_engineering:
+            rms = np.sqrt(np.mean(X * X, axis=1, dtype=np.float32))
+            centered = X - mean[:, None, :]
+            rmse = np.sqrt(np.mean(centered * centered, axis=1, dtype=np.float32))
+
+            if X.shape[1] > 1:
+                diff_1 = np.diff(X, n=1, axis=1)
+                diff_1_mean = np.mean(diff_1, axis=1, dtype=np.float32)
+            else:
+                diff_1_mean = np.zeros_like(mean, dtype=np.float32)
+
+            lag_blocks = []
+            last_idx = X.shape[1] - 1
+            for lag in (1, 3, 5, 10):
+                lag_idx = max(0, last_idx - lag)
+                lag_blocks.append(X[:, lag_idx, :])
+
+            feat_blocks.extend([rms, rmse, diff_1_mean] + lag_blocks)
+
+        return np.hstack(feat_blocks).astype(np.float32)
 
     def _extract_features_batched(self, X):
         X = np.asarray(X)
@@ -110,6 +194,8 @@ class LightGBMClassifierSK:
             idx = rng.choice(n_total, n_samples, replace=False)
         elif method == "interval":
             idx = np.linspace(0, n_total - 1, n_samples, dtype=int)
+        else:
+            idx = np.linspace(0, n_total - 1, n_samples, dtype=int)
         return X[idx], y[idx]
 
     def train(self, train_data, val_data):
@@ -120,47 +206,75 @@ class LightGBMClassifierSK:
             base_X = np.concatenate([train_X, val_X], axis=0)
             base_y = np.concatenate([train_y, val_y], axis=0)
             sampled_X, sampled_y = self._subsample_train_data(base_X, base_y)
-            X_fit_feat = self._extract_features_batched(sampled_X)
+            sampled_X = self._maybe_downsample_windows(sampled_X)
             y_fit_2d = np.asarray(sampled_y)
             if y_fit_2d.ndim == 1:
                 y_fit_2d = y_fit_2d.reshape(-1, 1)
             split_name = "merged train+val"
-            del base_X, base_y, sampled_X, sampled_y
+            del base_X, base_y, sampled_y
         else:
             sampled_X, sampled_y = self._subsample_train_data(train_X, train_y)
-            X_fit_feat = self._extract_features_batched(sampled_X)
+            sampled_X = self._maybe_downsample_windows(sampled_X)
             y_fit_2d = np.asarray(sampled_y)
             if y_fit_2d.ndim == 1:
                 y_fit_2d = y_fit_2d.reshape(-1, 1)
             split_name = "train only"
 
+        base_feat = None
+        if not self.signal_combo_map:
+            base_feat = self._extract_features_batched(sampled_X)
+
+        feature_dim = base_feat.shape[1] if base_feat is not None else "dynamic"
         print(
             f"Start training multi-label LightGBM with {split_name}: "
-            f"{X_fit_feat.shape[0]} samples, {X_fit_feat.shape[1]} features, "
+            f"{sampled_X.shape[0]} samples, {feature_dim} features, "
             f"{y_fit_2d.shape[1]} labels..."
         )
 
         self.models = []
         for label_idx in range(y_fit_2d.shape[1]):
             model = self._estimator_cls(**self._model_params)
-            model.fit(X_fit_feat, y_fit_2d[:, label_idx])
+            if base_feat is not None:
+                fit_feat = base_feat
+            else:
+                label_X = self._select_windows_for_label(sampled_X, label_idx)
+                fit_feat = self._extract_features_batched(label_X)
+            model.fit(fit_feat, y_fit_2d[:, label_idx])
             self.models.append(model)
 
-        del X_fit_feat, y_fit_2d, train_X, train_y, val_X, val_y
+        del sampled_X, base_feat, y_fit_2d, train_X, train_y, val_X, val_y
         gc.collect()
         print("Training done.")
 
     def predict(self, test_X):
-        X_features = self._extract_features(test_X)
+        test_X = self._maybe_downsample_windows(test_X)
+        base_feat = None
+        if not self.signal_combo_map:
+            base_feat = self._extract_features(test_X)
 
-        per_label_preds = [model.predict(X_features) for model in self.models]
+        per_label_preds = []
+        for label_idx, model in enumerate(self.models):
+            if base_feat is not None:
+                feat = base_feat
+            else:
+                label_X = self._select_windows_for_label(test_X, label_idx)
+                feat = self._extract_features(label_X)
+            per_label_preds.append(model.predict(feat))
         return np.column_stack(per_label_preds).astype(int)
 
     def predict_proba(self, test_X):
-        X_features = self._extract_features(test_X)
+        test_X = self._maybe_downsample_windows(test_X)
+        base_feat = None
+        if not self.signal_combo_map:
+            base_feat = self._extract_features(test_X)
 
         probs = []
-        for model in self.models:
-            per_label_prob = model.predict_proba(X_features)
+        for label_idx, model in enumerate(self.models):
+            if base_feat is not None:
+                feat = base_feat
+            else:
+                label_X = self._select_windows_for_label(test_X, label_idx)
+                feat = self._extract_features(label_X)
+            per_label_prob = model.predict_proba(feat)
             probs.append(per_label_prob[:, 1])
         return np.column_stack(probs)

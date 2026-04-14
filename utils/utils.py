@@ -2,6 +2,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import numpy as np
 from pathlib import Path
+import math
 from sklearn.metrics import confusion_matrix
 from sklearn.metrics import matthews_corrcoef, multilabel_confusion_matrix
 from sklearn.metrics import (
@@ -50,6 +51,78 @@ def plot_per_class_confusion(y_true, y_pred, class_names):
 
     plt.tight_layout()
     plt.show()
+
+
+def plot_per_class_binary_confusions(
+    y_true,
+    y_pred,
+    class_names,
+    fold_label,
+    save_dir="outputs/train_100W_without_val",
+    show_plots=True,
+):
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+
+    if y_true.ndim == 1:
+        y_true = y_true.reshape(-1, 1)
+    if y_pred.ndim == 1:
+        y_pred = y_pred.reshape(-1, 1)
+
+    cms = multilabel_confusion_matrix(y_true, y_pred)
+    n_classes = len(class_names)
+    if n_classes == 0:
+        return None
+
+    n_cols = min(3, max(1, n_classes))
+    n_rows = int(math.ceil(n_classes / float(n_cols)))
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 4.2 * n_rows))
+    if isinstance(axes, np.ndarray):
+        axes = axes.flatten()
+    else:
+        axes = np.asarray([axes])
+
+    for i, (cm, name) in enumerate(zip(cms, class_names)):
+        ax = axes[i]
+        tn, fp, fn, tp = cm.ravel()
+        total = max(1, int(cm.sum()))
+
+        ann = np.array(
+            [
+                [f"TN\n{tn}\n{tn / total:.1%}", f"FP\n{fp}\n{fp / total:.1%}"],
+                [f"FN\n{fn}\n{fn / total:.1%}", f"TP\n{tp}\n{tp / total:.1%}"],
+            ]
+        )
+
+        sns.heatmap(
+            cm,
+            annot=ann,
+            fmt="",
+            cmap="Blues",
+            cbar=False,
+            ax=ax,
+            xticklabels=["Pred 0", "Pred 1"],
+            yticklabels=["True 0", "True 1"],
+            linewidths=0.5,
+            linecolor="white",
+        )
+        ax.set_title(name)
+        ax.set_xlabel("Predicted")
+        ax.set_ylabel("Actual")
+
+    for j in range(n_classes, len(axes)):
+        axes[j].axis("off")
+
+    plt.tight_layout()
+    save_path = Path(save_dir)
+    save_path.mkdir(parents=True, exist_ok=True)
+    out_file = save_path / f"binary_confusion_{fold_label}.png"
+    fig.savefig(out_file, dpi=150)
+    if show_plots:
+        plt.show()
+    plt.close(fig)
+
+    return str(out_file)
 
 def calculate_mcc_multilabel(y_true, y_pred):
     n_classes = y_true.shape[1]
@@ -215,8 +288,10 @@ def plot_confusion_and_timeline(
     save_path = Path(save_dir)
     save_path.mkdir(parents=True, exist_ok=True)
 
-    y_true_idx = _multilabel_to_single_index(y_true)
-    y_pred_idx = _multilabel_to_single_index(y_pred)
+    y_true_arr = np.asarray(y_true)
+    y_pred_arr = np.asarray(y_pred)
+    y_true_idx = _multilabel_to_single_index(y_true_arr)
+    y_pred_idx = _multilabel_to_single_index(y_pred_arr)
     n_classes = len(class_names)
     labels = list(range(n_classes))
 
@@ -295,4 +370,17 @@ def plot_confusion_and_timeline(
         plt.show()
     plt.close(fig_tl)
 
-    return {"confusion_path": str(cm_file), "timeline_path": str(tl_file)}
+    binary_cm_file = plot_per_class_binary_confusions(
+        y_true=y_true_arr,
+        y_pred=y_pred_arr,
+        class_names=class_names,
+        fold_label=fold_label,
+        save_dir=save_dir,
+        show_plots=show_plots,
+    )
+
+    return {
+        "confusion_path": str(cm_file),
+        "timeline_path": str(tl_file),
+        "binary_confusion_path": binary_cm_file,
+    }

@@ -1,6 +1,10 @@
 import random
 import gc
-import sys
+import copy
+import json
+from pathlib import Path
+from datetime import datetime
+
 import numpy as np
 from utils.utils import (
     evaluate_and_print_multilabel_metrics,
@@ -8,113 +12,39 @@ from utils.utils import (
 )
 from utils.config import Config
 from data_handler import DataHandler
-from models.XGB import XGBoostClassifierSK
-from models.LGBM import LightGBMClassifierSK
+from pipeline import (
+    resolve_dataset_file,
+    parse_bool_arg,
+    parse_fold_list,
+    sample_windows_for_timeline,
+    to_jsonable,
+    build_model,
+)
 import warnings
+
+# import sys
+# import numpy.core.numeric
+# sys.modules['numpy._core.numeric'] = numpy.core.numeric
+
+
 warnings.filterwarnings("ignore")
 
 
-def resolve_dataset_file(data_arg):
-    if data_arg is None:
-        return "cps_data_multi_label.pkl"
+def align_test_scale_with_train(test_x, source_scaler, target_scaler):
+    if (
+        test_x is None
+        or not isinstance(test_x, np.ndarray)
+        or test_x.size == 0
+        or source_scaler is None
+        or target_scaler is None
+    ):
+        return test_x
 
-    text = str(data_arg).strip().lower()
-    if text in {"", "raw", "origin", "original", "none"}:
-        return "cps_data_multi_label.pkl"
-
-    if text.isdigit():
-        step = int(text)
-        return f"cps_windows_2s_2000hz_step_{step}.pkl"
-
-    return str(data_arg).strip()
-
-
-def parse_bool_arg(value, default=False):
-    if value is None:
-        return default
-    if isinstance(value, bool):
-        return value
-
-    text = str(value).strip().lower()
-    if text in {"1", "true", "yes", "y", "on"}:
-        return True
-    if text in {"0", "false", "no", "n", "off"}:
-        return False
-    return default
-
-
-def detect_preprocess_order(argv_tokens):
-    subsample_flags = {"--subsample_method", "--train_sample_num"}
-    downsample_flag = "--downsample_method"
-
-    subsample_pos = min(
-        [idx for idx, token in enumerate(argv_tokens) if token in subsample_flags],
-        default=None,
-    )
-    downsample_pos = next(
-        (idx for idx, token in enumerate(argv_tokens) if token == downsample_flag),
-        None,
-    )
-
-    if subsample_pos is not None and downsample_pos is not None:
-        if subsample_pos < downsample_pos:
-            return "subsample_first"
-        return "downsample_first"
-    return "downsample_first"
-
-
-def parse_fold_list(text):
-    if not text:
-        return [1, 2, 3, 4]
-    fold_ids = []
-    for part in str(text).split(","):
-        value = int(part.strip())
-        if value < 1 or value > 4:
-            raise ValueError(f"Fold id must be in [1, 4], but got {value}.")
-        fold_ids.append(value)
-    return fold_ids
-
-def build_model(args, target_vals, config, preprocess_order):
-    model_name = str(args.model).lower() if args.model else "xgboost"
-    model_downsample_method = args.downsample_method if preprocess_order == "subsample_first" else "false"
-
-    if model_name == "xgboost":
-        return XGBoostClassifierSK(
-            target_vals,
-            use_val_in_train=parse_bool_arg(args.train_with_val, default=False),
-            use_gpu=parse_bool_arg(args.use_gpu, default=False),
-            subsample_method=args.subsample_method,
-            n_train_data_samples=args.train_sample_num,
-            max_depth=getattr(args, "max_depth", 6),
-            colsample_bytree=getattr(args, "colsample_bytree", 0.8),
-            pre_downsample_method=model_downsample_method,
-            pre_downsample_factor=config.prep.ds_factor,
-        )
-
-    if model_name == "lightgbm":
-        return LightGBMClassifierSK(
-            target_vals,
-            use_val_in_train=parse_bool_arg(args.train_with_val, default=False),
-            subsample_method=args.subsample_method,
-            n_train_data_samples=args.train_sample_num,
-            boosting_type=getattr(args, "boosting_type", "lgbt"),
-            max_depth=getattr(args, "max_depth", 6),
-            num_leaves=getattr(args, "num_leaves", 63),
-            colsample_bytree=getattr(args, "colsample_bytree", 0.8),
-            n_estimators=getattr(args, "n_estimators", 1000),
-            learning_rate=getattr(args, "learning_rate", 0.05),
-            subsample=getattr(args, "subsample", 0.8),
-            reg_alpha=getattr(args, "reg_alpha", 0.0),
-            reg_lambda=getattr(args, "reg_lambda", 0.0),
-            drop_rate=getattr(args, "drop_rate", 0.1),
-            max_drop=getattr(args, "max_drop", None),
-            skip_drop=getattr(args, "skip_drop", None),
-            min_child_samples=getattr(args, "min_child_samples", 30),
-            min_data_in_leaf=getattr(args, "min_data_in_leaf", 10),
-            feature_batch_size=getattr(args, "feature_batch_size", 2000),
-            pre_downsample_method=model_downsample_method,
-            pre_downsample_factor=config.prep.ds_factor,
-        )
+    n_channels = test_x.shape[-1]
+    flat = test_x.reshape(-1, n_channels)
+    raw_flat = source_scaler.inverse_transform(flat)
+    train_scaled_flat = target_scaler.transform(raw_flat)
+    return train_scaled_flat.reshape(test_x.shape).astype(np.float32, copy=False)
 
 
 if __name__ == '__main__':
@@ -127,7 +57,7 @@ if __name__ == '__main__':
     parser.add_argument(
         "--data",
         default="raw",
-        help="Dataset selector: raw (default), or a step number like 100/200/400/500, or a custom filename under data/."
+        help="Dataset selector: raw (default), or a step number like 100/200/400/500/800/1000, or a custom filename under data/."
     )
     parser.add_argument(
         "--output",
@@ -168,11 +98,6 @@ if __name__ == '__main__':
         help="Idx of training and testing fold"
     )
     parser.add_argument(
-        "--balance",
-        default=False,
-        help="Balance class distribution in the training set."
-    )
-    parser.add_argument(
         "--use_gpu",
         default=False,
         help="Whether to use GPU or not."
@@ -186,6 +111,33 @@ if __name__ == '__main__':
         "--signal_combo",
         default=False,
         help="Whether to use the specific signal combinations for training (default: False)."
+    )
+    parser.add_argument(
+        "--feature_engineering",
+        default=False,
+        help="Enable additional engineered features: RMS, RMSE, first-order diff, and lags (1,3,5,10)."
+    )
+    parser.add_argument(
+        "--test_on_step1_full",
+        default=False,
+        help="Use full step=1 sliding windows for test split while keeping train/val from --data."
+    )
+    parser.add_argument(
+        "--single_label_only",
+        default=False,
+        help="Remove multi-label samples from training set (keep samples with <=1 active label)."
+    )
+    parser.add_argument(
+        "--driving_pos_threshold",
+        type=float,
+        default=None,
+        help="Positive-scope threshold for Driving labels in training filter, range [0,1]."
+    )
+    parser.add_argument(
+        "--lifting_pos_threshold",
+        type=float,
+        default=None,
+        help="Positive-scope threshold for Lifting labels in training filter, range [0,1]."
     )
     subparsers = parser.add_subparsers(dest="model", help="Select the model type.")
     parser_XGB = subparsers.add_parser(
@@ -299,13 +251,12 @@ if __name__ == '__main__':
     config = Config()
     config.data.dataset_file = resolve_dataset_file(args.data)
     show_images = parse_bool_arg(args.show_images, default=False)
-    preprocess_order = detect_preprocess_order(sys.argv[1:])
-    print(f"Preprocess order: {preprocess_order}")
+    preprocess_order = "subsample_first"
+    print("Preprocess order: subsample_first")
 
     SEED = 42
     random.seed(SEED)
     np.random.seed(SEED)
-    val_mccs = []
     test_mccs = []
 
     fold_ids = parse_fold_list(args.folds)
@@ -314,15 +265,51 @@ if __name__ == '__main__':
     macro_briers = []
     all_true = []
     all_pred = []
-    all_test_x = []
+    all_test_x_timeline = []
 
-    lr_histories_by_fold = {}
+    overall_timeline_max_windows = 12000
+    per_fold_timeline_windows = max(500, overall_timeline_max_windows // max(1, len(fold_ids)))
+    run_summary = {
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "script": "main.py",
+        "model": args.model if args.model else "XGBoost",
+        "resolved_dataset_file": config.data.dataset_file,
+        "preprocess_order": preprocess_order,
+        "arguments": vars(args),
+        "folds": [],
+        "aggregate": {},
+    }
 
     # load data
-    datahandler_downsample_method = (
-        args.downsample_method if preprocess_order == "downsample_first" else "false"
+    datahandler = DataHandler(
+        config=config,
+        downsample_method=args.downsample_method,
+        subsample_method=args.subsample_method,
+        n_train_data_samples=args.train_sample_num,
+        preprocess_order=preprocess_order,
+        single_label_only=args.single_label_only,
+        driving_pos_threshold=args.driving_pos_threshold,
+        lifting_pos_threshold=args.lifting_pos_threshold,
     )
-    datahandler = DataHandler(config=config, downsample_method=datahandler_downsample_method)
+    test_on_step1_full = parse_bool_arg(args.test_on_step1_full, default=False)
+    external_test_handler = None
+    if test_on_step1_full:
+        external_test_config = copy.deepcopy(config)
+        external_test_config.data.dataset_file = resolve_dataset_file("raw")
+        external_test_handler = DataHandler(
+            config=external_test_config,
+            downsample_method=args.downsample_method,
+            subsample_method="false",
+            n_train_data_samples=args.train_sample_num,
+            preprocess_order=preprocess_order,
+            single_label_only=False,
+            driving_pos_threshold=None,
+            lifting_pos_threshold=None,
+        )
+        print(
+            "External test mode enabled: test split will use full step=1 windows "
+            "from raw data."
+        )
 
     # Leave-one-out: EXPERIMENT_ID = 1..4
     for fold_idx, fold in enumerate(fold_ids, start=1):
@@ -340,14 +327,32 @@ if __name__ == '__main__':
             print("Training model...")
             model.train(train, val)
             print("Evaluating model...")
-            predicted_y = model.predict(test[0])
 
-            predicted_prob = model.predict_proba(test[0]) if hasattr(model, "predict_proba") else None
+            if external_test_handler is not None:
+                external_test_handler.config.data.test_experiment_id = fold
+                external_test_handler.config.data.validation_experiment_id = val_id
+                _, _, external_test, _ = external_test_handler.get_data_loaders()
+
+                ext_x = align_test_scale_with_train(
+                    external_test[0],
+                    source_scaler=external_test_handler.scaler,
+                    target_scaler=datahandler.scaler,
+                )
+                eval_y_true = external_test[1]
+                eval_y_pred = model.predict(ext_x)
+                eval_y_prob = model.predict_proba(ext_x) if hasattr(model, "predict_proba") else None
+                eval_timeline_x = sample_windows_for_timeline(ext_x, per_fold_timeline_windows)
+                print(f"External test(step=1 full) samples: {len(eval_y_true)}")
+            else:
+                eval_y_true = test[1]
+                eval_y_pred = model.predict(test[0])
+                eval_y_prob = model.predict_proba(test[0]) if hasattr(model, "predict_proba") else None
+                eval_timeline_x = test[0]
 
             fold_metrics = evaluate_and_print_multilabel_metrics(
-                y_true=test[1],
-                y_pred=predicted_y,
-                y_prob=predicted_prob,
+                y_true=eval_y_true,
+                y_pred=eval_y_pred,
+                y_prob=eval_y_prob,
                 class_names=target_vals,
                 fold_idx=fold,
                 split_name="Test",
@@ -358,29 +363,46 @@ if __name__ == '__main__':
             macro_briers.append(fold_metrics["macro_brier"])
 
             plot_paths = plot_confusion_and_timeline(
-                y_true=test[1],
-                y_pred=predicted_y,
+                y_true=eval_y_true,
+                y_pred=eval_y_pred,
                 class_names=target_vals,
                 fold_label=f"fold_{fold}",
-                X_for_timeline=test[0],
+                X_for_timeline=eval_timeline_x,
                 save_dir=args.output,
                 show_plots=show_images,
             )
-            print(f"Saved fold plots: {plot_paths['confusion_path']} | {plot_paths['timeline_path']}")
+            print(
+                f"Saved fold plots: {plot_paths['confusion_path']} | "
+                f"{plot_paths['timeline_path']} | {plot_paths.get('binary_confusion_path')}"
+            )
 
-            all_true.append(test[1])
-            all_pred.append(predicted_y)
-            all_test_x.append(test[0])
+            all_true.append(eval_y_true)
+            all_pred.append(eval_y_pred)
+            sampled_timeline_x = sample_windows_for_timeline(eval_timeline_x, per_fold_timeline_windows)
+            if sampled_timeline_x is not None and len(sampled_timeline_x) > 0:
+                all_test_x_timeline.append(sampled_timeline_x)
 
             test_mcc = fold_metrics["macro_mcc"]
             test_mccs.append(test_mcc)
+
+            run_summary["folds"].append(
+                {
+                    "fold": int(fold),
+                    "validation_experiment_id": int(val_id),
+                    "train_samples": int(train[0].shape[0]) if train and train[0] is not None else 0,
+                    "val_samples": int(val[0].shape[0]) if val and val[0] is not None else 0,
+                    "test_samples": int(eval_y_true.shape[0]) if eval_y_true is not None else 0,
+                    "metrics": fold_metrics,
+                    "plots": plot_paths,
+                }
+            )
 
 
         except Exception as e:
             print(f"Fold {fold} failed with error: {e}")
             raise e
 
-        del train, val, test, predicted_y, predicted_prob, model
+        del train, val, test, model
         gc.collect()
         print("--- End of Fold ---")
 
@@ -389,7 +411,7 @@ if __name__ == '__main__':
     if all_true and all_pred:
         overall_true = np.concatenate(all_true, axis=0)
         overall_pred = np.concatenate(all_pred, axis=0)
-        overall_x = np.concatenate(all_test_x, axis=0) if all_test_x else None
+        overall_x = np.concatenate(all_test_x_timeline, axis=0) if all_test_x_timeline else None
         overall_plot_paths = plot_confusion_and_timeline(
             y_true=overall_true,
             y_pred=overall_pred,
@@ -401,8 +423,32 @@ if __name__ == '__main__':
         )
         print(
             f"Saved overall plots: "
-            f"{overall_plot_paths['confusion_path']} | {overall_plot_paths['timeline_path']}"
+            f"{overall_plot_paths['confusion_path']} | "
+            f"{overall_plot_paths['timeline_path']} | "
+            f"{overall_plot_paths.get('binary_confusion_path')}"
         )
+    else:
+        overall_plot_paths = {}
+
+    run_summary["aggregate"] = {
+        "folds": [int(x) for x in fold_ids],
+        "mcc_per_fold": test_mccs,
+        "macro_f1_per_fold": macro_f1s,
+        "macro_pr_auc_per_fold": macro_pr_aucs,
+        "macro_brier_per_fold": macro_briers,
+        "avg_mcc": avg_mcc,
+        "avg_macro_f1": float(np.mean(macro_f1s)) if macro_f1s else None,
+        "avg_macro_pr_auc": float(np.nanmean(macro_pr_aucs)) if macro_pr_aucs else None,
+        "avg_macro_brier": float(np.mean(macro_briers)) if macro_briers else None,
+        "overall_plots": overall_plot_paths,
+    }
+
+    output_dir = Path(args.output)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    summary_path = output_dir / "run_summary.json"
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(to_jsonable(run_summary), f, ensure_ascii=False, indent=2)
+    print(f"Saved run summary: {summary_path}")
 
     print("Scores for each run: ", test_mccs)
     print(f"Macro-F1 per fold: {macro_f1s} | avg={np.mean(macro_f1s):.4f}")

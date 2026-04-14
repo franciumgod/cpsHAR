@@ -10,7 +10,13 @@ class DataHandler:
     def __init__(
         self,
         config,
-        downsample_method="false",
+        downsample_method="sliding_window",
+        subsample_method="interval",
+        n_train_data_samples=100_000,
+        preprocess_order="downsample_first",
+        single_label_only=False,
+        driving_pos_threshold=None,
+        lifting_pos_threshold=None,
         downsample_window_size=40,
         downsample_window_step=20,
     ):
@@ -21,6 +27,14 @@ class DataHandler:
         )
         self.downsample_window_size = downsample_window_size
         self.downsample_window_step = downsample_window_step
+        self.subsample_method = (
+            str(subsample_method).lower() if subsample_method is not None else "false"
+        )
+        self.n_train_data_samples = int(n_train_data_samples)
+        self.preprocess_order = str(preprocess_order).lower()
+        self.single_label_only = str(single_label_only).strip().lower() in {"1", "true", "yes", "y", "on"}
+        self.driving_pos_threshold = self._parse_threshold(driving_pos_threshold)
+        self.lifting_pos_threshold = self._parse_threshold(lifting_pos_threshold)
 
         self.data_root = Path(r"D:\Code\research_intern\Pal2sim\cpsHAR\data")
         self.local_path = self.data_root / Path(self.config.data.dataset_file).name
@@ -31,6 +45,19 @@ class DataHandler:
         self._source_segment_cache = {}
 
         self._load_data_set()
+
+    @staticmethod
+    def _parse_threshold(value):
+        if value is None:
+            return None
+        text = str(value).strip().lower()
+        if text in {"", "none", "null", "false"}:
+            return None
+        try:
+            parsed = float(text)
+        except ValueError:
+            return None
+        return max(0.0, min(1.0, parsed))
 
     def _get_merged_data(self, meta_subset):
         merged = [row["data"] for _, row in meta_subset.iterrows()]
@@ -81,10 +108,7 @@ class DataHandler:
             if {"scenario", "experiment", "source_index", "start_idx", "end_idx"}.issubset(cols):
                 return "sample_manifest"
 
-        raise ValueError(
-            f"Unsupported dataset format in {self.local_path}. "
-            "Expected raw metadata dataframe or sample manifest payload."
-        )
+        return "raw"
 
     def _load_data_set(self):
         self.local_path.parent.mkdir(parents=True, exist_ok=True)
@@ -191,15 +215,12 @@ class DataHandler:
         elif method == "sliding_window":
             ds_df = self._downsample_sliding_window(df, sensor_cols, label_cols)
         else:
-            raise ValueError(
-                f"Unsupported downsample_method='{self.downsample_method}'. "
-                "Expected one of: false, interval, sliding_window."
-            )
+            ds_df = df.reset_index(drop=True)
 
         print(f"Downsample [{split_name}] with method={method}: {len(df)} -> {len(ds_df)} rows")
         return ds_df
 
-    def _maybe_downsample_window_array(self, X, split_name):
+    def _maybe_downsample_window_array(self, X, split_name=None):
         method = self.downsample_method
         if method in {"false", "none", "0"}:
             X_ds = X
@@ -210,24 +231,207 @@ class DataHandler:
             win = self.downsample_window_size
             step = self.downsample_window_step
             if X.shape[1] < win:
-                raise ValueError(
-                    f"Window length {X.shape[1]} is smaller than sliding downsample window {win}."
-                )
+                return X.astype(np.float32, copy=False)
 
             windows = sliding_window_view(X, window_shape=win, axis=1)
             windows = windows[:, ::step, :, :]
             X_ds = windows.mean(axis=-1, dtype=np.float32)
         else:
-            raise ValueError(
-                f"Unsupported downsample_method='{self.downsample_method}'. "
-                "Expected one of: false, interval, sliding_window."
+            X_ds = X
+
+        if split_name is not None:
+            print(
+                f"Downsample [{split_name}] sample windows with method={method}: "
+                f"{X.shape[1]} -> {X_ds.shape[1]} steps"
+            )
+        return X_ds.astype(np.float32, copy=False)
+
+    def _select_subsample_indices(self, total_windows, apply_subsample=True):
+        if total_windows <= 0:
+            return np.empty((0,), dtype=np.int64)
+
+        if not apply_subsample:
+            return np.arange(total_windows, dtype=np.int64)
+
+        method = self.subsample_method
+        if method in {"false", "none", "0"}:
+            return np.arange(total_windows, dtype=np.int64)
+
+        n_samples = min(max(self.n_train_data_samples, 0), total_windows)
+        if n_samples >= total_windows:
+            return np.arange(total_windows, dtype=np.int64)
+
+        if method == "interval":
+            return np.linspace(0, total_windows - 1, n_samples, dtype=np.int64)
+
+        rng = np.random.RandomState(42)
+        if method == "random":
+            return rng.choice(total_windows, n_samples, replace=False).astype(np.int64)
+
+        return np.arange(total_windows, dtype=np.int64)
+
+    def _maybe_subsample_window_samples(self, X, y, split_name, apply_subsample):
+        if not apply_subsample:
+            return X, y
+
+        idx = self._select_subsample_indices(len(X), apply_subsample=True)
+        if len(idx) == len(X):
+            print(f"Subsample [{split_name}] windows: total={len(X)} -> kept={len(X)}")
+            return X, y
+
+        X_sub = X[idx]
+        y_sub = y[idx]
+        print(f"Subsample [{split_name}] windows: total={len(X)} -> kept={len(X_sub)}")
+        return X_sub, y_sub
+
+    def _build_train_filter_mask(self, y, label_cols, split_name):
+        y_arr = np.asarray(y)
+        if y_arr.ndim == 1:
+            y_arr = y_arr.reshape(-1, 1)
+
+        n_samples = len(y_arr)
+        if n_samples == 0:
+            return np.empty((0,), dtype=bool)
+
+        keep_mask = np.ones(n_samples, dtype=bool)
+        label_to_idx = {name: idx for idx, name in enumerate(label_cols)}
+
+        if self.single_label_only:
+            active_counts = np.sum(y_arr, axis=1)
+            single_mask = active_counts <= 1
+            before = int(np.sum(keep_mask))
+            keep_mask &= single_mask
+            after = int(np.sum(keep_mask))
+            print(
+                f"Post-filter [{split_name}] single_label_only: "
+                f"{before} -> {after} samples"
             )
 
-        print(
-            f"Downsample [{split_name}] sample windows with method={method}: "
-            f"{X.shape[1]} -> {X_ds.shape[1]} steps"
-        )
-        return X_ds.astype(np.float32, copy=False)
+        def apply_group_threshold(group_name, idx_list, threshold):
+            nonlocal keep_mask
+            if threshold is None or not idx_list:
+                return
+
+            group_values = y_arr[:, idx_list].astype(np.float32)
+            group_ratio = np.mean(group_values, axis=1)
+            positive_scope = group_ratio > 0.0
+            cond = (~positive_scope) | (group_ratio >= threshold)
+
+            before = int(np.sum(keep_mask))
+            keep_mask &= cond
+            after = int(np.sum(keep_mask))
+            pos_total = int(np.sum(positive_scope))
+            pos_filtered = int(np.sum(positive_scope & ~cond))
+            print(
+                f"Post-filter [{split_name}] {group_name} threshold>={threshold:.2f} "
+                f"(positive scope): {before} -> {after} samples | "
+                f"positive_total={pos_total}, filtered={pos_filtered}"
+            )
+
+        driving_idx = [idx for name, idx in label_to_idx.items() if name.startswith("Driving(")]
+        lifting_idx = [idx for name, idx in label_to_idx.items() if name.startswith("Lifting(")]
+        apply_group_threshold("Driving", driving_idx, self.driving_pos_threshold)
+        apply_group_threshold("Lifting", lifting_idx, self.lifting_pos_threshold)
+
+        return keep_mask
+
+    def _apply_post_subsample_filters(self, X, y, label_cols, split_name, apply_filters=True):
+        before = len(X)
+        if not apply_filters:
+            return X, y
+
+        keep_mask = self._build_train_filter_mask(y, label_cols=label_cols, split_name=split_name)
+        X = X[keep_mask]
+        y = y[keep_mask]
+        after = len(X)
+        print(f"Post-subsample filter [{split_name}]: {before} -> {after} samples")
+        return X, y
+
+    def _apply_post_subsample_start_filters(
+        self,
+        starts,
+        y_selected,
+        label_cols,
+        split_name,
+        apply_filters=True,
+    ):
+        before = len(starts)
+        if not apply_filters:
+            return starts
+
+        keep_mask = self._build_train_filter_mask(y_selected, label_cols=label_cols, split_name=split_name)
+        filtered = starts[keep_mask]
+        after = len(filtered)
+        print(f"Post-subsample filter [{split_name}] starts: {before} -> {after}")
+        return filtered
+
+    def _window_len_after_downsample(self, seq_len):
+        method = self.downsample_method
+        if method in {"false", "none", "0"}:
+            return seq_len
+        if method == "interval":
+            factor = max(1, int(self.config.prep.ds_factor))
+            return 1 + (seq_len - 1) // factor
+        if method == "sliding_window":
+            if seq_len < self.downsample_window_size:
+                return seq_len
+            return 1 + (seq_len - self.downsample_window_size) // self.downsample_window_step
+        return seq_len
+
+    def _extract_subsampled_windows_batched(
+        self,
+        df,
+        seq_len,
+        sensor_cols,
+        label_cols,
+        split_name,
+        apply_subsample=True,
+        apply_downsample=True,
+        apply_post_subsample_filters=False,
+    ):
+        sensor_values = df[sensor_cols].to_numpy(dtype=np.float32, copy=False)
+        label_values = df[label_cols].to_numpy(dtype=np.int8, copy=False)
+        total_windows = max(0, len(df) - seq_len + 1)
+        starts = self._select_subsample_indices(total_windows, apply_subsample=apply_subsample)
+        if apply_post_subsample_filters and len(starts) > 0:
+            selected_y = label_values[starts + seq_len - 1]
+            starts = self._apply_post_subsample_start_filters(
+                starts,
+                selected_y,
+                label_cols=label_cols,
+                split_name=split_name,
+                apply_filters=True,
+            )
+
+        n_samples = len(starts)
+        out_len = self._window_len_after_downsample(seq_len) if apply_downsample else seq_len
+        X = np.empty((n_samples, out_len, len(sensor_cols)), dtype=np.float32)
+        y = np.empty((n_samples, len(label_cols)), dtype=np.int8)
+        if n_samples == 0:
+            return X, y
+
+        base_steps = np.arange(seq_len, dtype=np.int64)
+        batch_size = 256
+        write_pos = 0
+
+        for start_idx in range(0, n_samples, batch_size):
+            batch_starts = starts[start_idx: start_idx + batch_size]
+            idx_matrix = batch_starts[:, None] + base_steps[None, :]
+            batch_windows = sensor_values[idx_matrix]
+            batch_labels = label_values[batch_starts + seq_len - 1]
+            if apply_downsample:
+                batch_windows = self._maybe_downsample_window_array(batch_windows, split_name=None)
+            else:
+                batch_windows = batch_windows.astype(np.float32, copy=False)
+
+            batch_len = len(batch_starts)
+            X[write_pos: write_pos + batch_len] = batch_windows
+            y[write_pos: write_pos + batch_len] = batch_labels
+            write_pos += batch_len
+
+        action = "selected" if apply_subsample else "all"
+        print(f"Subsample-first [{split_name}] windows: total={total_windows} -> {action}={n_samples}")
+        return X, y
 
     def _fit_and_apply_scaler(self, train_x, val_x, test_x):
         n_channels = train_x.shape[-1]
@@ -297,36 +501,65 @@ class DataHandler:
         validation_df = self._prepare_raw_df(validation_df)
 
         final_target_cols = self._get_final_target_cols()
-        train_df = self._maybe_downsample(train_df, self.config.data.sensor_cols, final_target_cols, "train")
-        validation_df = self._maybe_downsample(
-            validation_df,
-            self.config.data.sensor_cols,
-            final_target_cols,
-            "val",
-        )
-        test_df = self._maybe_downsample(test_df, self.config.data.sensor_cols, final_target_cols, "test")
-
         self.config.IN_CHANNELS = len(self.config.data.sensor_cols)
 
-        seq_len = self._get_effective_seq_len_for_raw()
-        train_x, train_y = self._get_challenge_data_numpy(
-            train_df,
-            seq_len,
-            self.config.data.sensor_cols,
-            final_target_cols,
-        )
-        val_x, val_y = self._get_challenge_data_numpy(
-            validation_df,
-            seq_len,
-            self.config.data.sensor_cols,
-            final_target_cols,
-        )
-        test_x, test_y = self._get_challenge_data_numpy(
-            test_df,
-            seq_len,
-            self.config.data.sensor_cols,
-            final_target_cols,
-        )
+        if self.preprocess_order == "subsample_first":
+            train_seq_len = int(self.config.prep.original_freq * self.config.prep.seq_len_multiplier)
+            train_x, train_y = self._extract_subsampled_windows_batched(
+                train_df,
+                train_seq_len,
+                self.config.data.sensor_cols,
+                final_target_cols,
+                "train",
+                apply_subsample=True,
+                apply_downsample=True,
+                apply_post_subsample_filters=True,
+            )
+            val_x, val_y = self._extract_subsampled_windows_batched(
+                validation_df,
+                train_seq_len,
+                self.config.data.sensor_cols,
+                final_target_cols,
+                "val",
+                apply_subsample=False,
+            )
+            test_x, test_y = self._extract_subsampled_windows_batched(
+                test_df,
+                train_seq_len,
+                self.config.data.sensor_cols,
+                final_target_cols,
+                "test",
+                apply_subsample=False,
+            )
+        else:
+            train_df = self._maybe_downsample(train_df, self.config.data.sensor_cols, final_target_cols, "train")
+            validation_df = self._maybe_downsample(
+                validation_df,
+                self.config.data.sensor_cols,
+                final_target_cols,
+                "val",
+            )
+            test_df = self._maybe_downsample(test_df, self.config.data.sensor_cols, final_target_cols, "test")
+
+            seq_len = self._get_effective_seq_len_for_raw()
+            train_x, train_y = self._get_challenge_data_numpy(
+                train_df,
+                seq_len,
+                self.config.data.sensor_cols,
+                final_target_cols,
+            )
+            val_x, val_y = self._get_challenge_data_numpy(
+                validation_df,
+                seq_len,
+                self.config.data.sensor_cols,
+                final_target_cols,
+            )
+            test_x, test_y = self._get_challenge_data_numpy(
+                test_df,
+                seq_len,
+                self.config.data.sensor_cols,
+                final_target_cols,
+            )
 
         train_x, val_x, test_x = self._fit_and_apply_scaler(train_x, val_x, test_x)
         return (train_x, train_y), (val_x, val_y), (test_x, test_y), final_target_cols
@@ -344,6 +577,19 @@ class DataHandler:
         val_x, val_y = self._materialize_window_samples(validation_manifest, final_target_cols)
         test_x, test_y = self._materialize_window_samples(test_manifest, final_target_cols)
 
+        train_x, train_y = self._maybe_subsample_window_samples(
+            train_x,
+            train_y,
+            split_name="train",
+            apply_subsample=True,
+        )
+        train_x, train_y = self._apply_post_subsample_filters(
+            train_x,
+            train_y,
+            label_cols=final_target_cols,
+            split_name="train",
+            apply_filters=True,
+        )
         train_x = self._maybe_downsample_window_array(train_x, "train")
         val_x = self._maybe_downsample_window_array(val_x, "val")
         test_x = self._maybe_downsample_window_array(test_x, "test")
@@ -370,6 +616,19 @@ class DataHandler:
         test_x = X[test_mask]
         test_y = y[test_mask]
 
+        train_x, train_y = self._maybe_subsample_window_samples(
+            train_x,
+            train_y,
+            split_name="train",
+            apply_subsample=True,
+        )
+        train_x, train_y = self._apply_post_subsample_filters(
+            train_x,
+            train_y,
+            label_cols=final_target_cols,
+            split_name="train",
+            apply_filters=True,
+        )
         train_x = self._maybe_downsample_window_array(train_x, "train")
         val_x = self._maybe_downsample_window_array(val_x, "val")
         test_x = self._maybe_downsample_window_array(test_x, "test")
@@ -388,5 +647,4 @@ class DataHandler:
             return self._get_data_loaders_from_sample_manifest()
         if self.dataset_kind == "window_samples":
             return self._get_data_loaders_from_window_samples()
-
-        raise ValueError(f"Unsupported dataset kind: {self.dataset_kind}")
+        return self._get_data_loaders_from_raw()
