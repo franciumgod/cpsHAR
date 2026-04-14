@@ -47,6 +47,44 @@ def align_test_scale_with_train(test_x, source_scaler, target_scaler):
     return train_scaled_flat.reshape(test_x.shape).astype(np.float32, copy=False)
 
 
+def _split_label_stats(y, class_names):
+    y_arr = np.asarray(y)
+    if y_arr.ndim == 1:
+        y_arr = y_arr.reshape(-1, 1)
+
+    n_samples = int(len(y_arr))
+    n_classes = int(y_arr.shape[1]) if y_arr.ndim == 2 else 0
+    pos_counts = np.sum(y_arr, axis=0).astype(int) if n_samples > 0 else np.zeros((n_classes,), dtype=int)
+    multi_label_count = int(np.sum(np.sum(y_arr, axis=1) > 1)) if n_samples > 0 else 0
+
+    rows = []
+    max_len = max(len(class_names), n_classes)
+    for i in range(max_len):
+        class_name = class_names[i] if i < len(class_names) else f"class_{i}"
+        class_pos = int(pos_counts[i]) if i < len(pos_counts) else 0
+        rows.append((class_name, class_pos))
+
+    return n_samples, rows, multi_label_count
+
+
+def print_fold_data_overview(train, val, test, class_names):
+    train_n = int(train[0].shape[0]) if train and train[0] is not None else 0
+    val_n = int(val[0].shape[0]) if val and val[0] is not None else 0
+    test_n = int(test[0].shape[0]) if test and test[0] is not None else 0
+    print(
+        f"Split samples before training: "
+        f"train={train_n}, val={val_n}, test={test_n}"
+    )
+
+    for split_name, split_data in (("train", train), ("val", val), ("test", test)):
+        y = split_data[1] if split_data and len(split_data) > 1 else np.empty((0, len(class_names)), dtype=np.int8)
+        n_samples, rows, multi_label_count = _split_label_stats(y, class_names)
+        print(f"[{split_name}] samples={n_samples}")
+        for class_name, class_pos in rows:
+            print(f"  - {class_name}: {class_pos}")
+        print(f"  - Multilabel(>1 active labels): {multi_label_count}")
+
+
 if __name__ == '__main__':
     import argparse
 
@@ -116,6 +154,48 @@ if __name__ == '__main__':
         "--feature_engineering",
         default=False,
         help="Enable additional engineered features: RMS, RMSE, first-order diff, and lags (1,3,5,10)."
+    )
+    parser.add_argument(
+        "--sample_augment",
+        default="false",
+        help="Sample perturbation augmentation for training only. "
+             "Use False/0 to disable (default), True to add 1 augmented sample per matched sample, "
+             "or pass an integer N to add N augmented samples per matched sample."
+    )
+    parser.add_argument(
+        "--augment_target",
+        default="multilabel",
+        help="Augmentation target class selector. Default 'multilabel' (samples with >1 active labels). "
+             "You can also pass a class name to target that class."
+    )
+    parser.add_argument(
+        "--augment_method",
+        default="jitter",
+        help="Augmentation method(s), comma-separated. "
+             "Supported: jitter,scaling,rotation,mixup,cutmix,smote,basic."
+    )
+    parser.add_argument(
+        "--mixup_alpha",
+        type=float,
+        default=0.4,
+        help="Beta(alpha, alpha) parameter used by mixup."
+    )
+    parser.add_argument(
+        "--cutmix_ratio",
+        type=float,
+        default=0.3,
+        help="Time-axis cut ratio used by cutmix, in [0,1]."
+    )
+    parser.add_argument(
+        "--tta",
+        default="false",
+        help="Test-Time Augmentation count. False/0 disables; True enables 1 view; integer N enables N views."
+    )
+    parser.add_argument(
+        "--tta_method",
+        default="jitter",
+        help="TTA method(s), comma-separated. "
+             "Supported: jitter,scaling,rotation,mixup,cutmix,smote,basic."
     )
     parser.add_argument(
         "--test_on_step1_full",
@@ -320,6 +400,7 @@ if __name__ == '__main__':
         datahandler.config.data.validation_experiment_id = val_id
 
         train, val, test, target_vals = datahandler.get_data_loaders()
+        print_fold_data_overview(train, val, test, target_vals)
 
         try:
 

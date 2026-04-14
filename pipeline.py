@@ -138,6 +138,9 @@ def build_model(
     use_signal_combo = parse_bool_arg(getattr(args, "signal_combo", False), default=False)
     augment_count = parse_augment_count(getattr(args, "sample_augment", False))
     augment_target = str(getattr(args, "augment_target", "multilabel")).strip()
+    augment_method = str(getattr(args, "augment_method", "jitter")).strip().lower()
+    tta_count = parse_augment_count(getattr(args, "tta", False))
+    tta_method = str(getattr(args, "tta_method", "jitter")).strip().lower()
     signal_combo_map = (
         build_special_signal_combo_map(config.data.sensor_cols) if use_signal_combo else None
     )
@@ -169,6 +172,11 @@ def build_model(
             signal_combo_map=signal_combo_map,
             augment_samples=augment_count,
             augment_target=augment_target,
+            augment_method=augment_method,
+            mixup_alpha=getattr(args, "mixup_alpha", 0.4),
+            cutmix_ratio=getattr(args, "cutmix_ratio", 0.3),
+            tta_samples=tta_count,
+            tta_method=tta_method,
             feature_engineering=parse_bool_arg(
                 getattr(args, "feature_engineering", False), default=False
             ),
@@ -187,6 +195,11 @@ def build_model(
         signal_combo_map=signal_combo_map,
         augment_samples=augment_count,
         augment_target=augment_target,
+        augment_method=augment_method,
+        mixup_alpha=getattr(args, "mixup_alpha", 0.4),
+        cutmix_ratio=getattr(args, "cutmix_ratio", 0.3),
+        tta_samples=tta_count,
+        tta_method=tta_method,
         feature_engineering=parse_bool_arg(
             getattr(args, "feature_engineering", False), default=False
         ),

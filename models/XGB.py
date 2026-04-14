@@ -28,9 +28,17 @@ class XGBoostClassifierSK:
         pre_downsample_window_size=40,
         pre_downsample_window_step=20,
         signal_combo_map=None,
+        sensor_cols=None,
         augment_samples=False,
         augment_target="multilabel",
         augment_noise_ratio=0.03,
+        augment_method="jitter",
+        mixup_alpha=0.4,
+        cutmix_ratio=0.3,
+        rotation_plane="xyz",
+        rotation_max_degrees=15.0,
+        tta_samples=False,
+        tta_method="jitter",
         feature_engineering=False,
     ):
         self.classes = classes
@@ -47,9 +55,19 @@ class XGBoostClassifierSK:
         self.pre_downsample_window_size = int(pre_downsample_window_size)
         self.pre_downsample_window_step = int(pre_downsample_window_step)
         self.signal_combo_map = signal_combo_map or {}
+        self.sensor_cols = list(sensor_cols) if sensor_cols is not None else []
+        self.rng = np.random.default_rng(random_state)
         self.augment_count = self._parse_augment_count(augment_samples)
         self.augment_target = str(augment_target).strip()
         self.augment_noise_ratio = float(augment_noise_ratio)
+        self.augment_methods = self._parse_method_list(augment_method, default="jitter")
+        self.mixup_alpha = max(1e-6, float(mixup_alpha))
+        self.cutmix_ratio = float(np.clip(float(cutmix_ratio), 0.0, 1.0))
+        self.rotation_plane = str(rotation_plane).strip().lower()
+        self.rotation_max_degrees = float(rotation_max_degrees)
+        self.tta_count = self._parse_augment_count(tta_samples)
+        self.tta_methods = self._parse_method_list(tta_method, default="jitter")
+        self._input_scaler = None
         self.feature_engineering = str(feature_engineering).strip().lower() in {
             "1",
             "true",
@@ -92,6 +110,21 @@ class XGBoostClassifierSK:
         except ValueError:
             return 0
         return max(0, parsed)
+
+    @staticmethod
+    def _parse_method_list(value, default="jitter"):
+        text = str(value).strip().lower() if value is not None else ""
+        if text in {"", "none", "false", "0", "off", "null"}:
+            return []
+        parts = [p.strip() for p in text.split(",") if p.strip()]
+        if not parts:
+            return []
+        valid = {"jitter", "scaling", "rotation", "mixup", "cutmix", "smote", "basic"}
+        methods = [p for p in parts if p in valid]
+        return methods if methods else ([default] if default else [])
+
+    def set_input_scaler(self, scaler):
+        self._input_scaler = scaler
 
     def _select_windows_for_label(self, X, label_idx):
         if not self.signal_combo_map:
@@ -215,6 +248,162 @@ class XGBoostClassifierSK:
             idx = np.linspace(0, n_total - 1, n_samples, dtype=int)
         return X[idx], y[idx]
 
+    def _resolve_rotation_indices(self, n_channels):
+        name_to_idx = {str(name): i for i, name in enumerate(self.sensor_cols)}
+        required = ["Acc.x", "Acc.y", "Acc.z", "Gyro.x", "Gyro.y", "Gyro.z"]
+        if all((k in name_to_idx and name_to_idx[k] < n_channels) for k in required):
+            acc_idx = np.array([name_to_idx["Acc.x"], name_to_idx["Acc.y"], name_to_idx["Acc.z"]], dtype=np.int64)
+            gyro_idx = np.array([name_to_idx["Gyro.x"], name_to_idx["Gyro.y"], name_to_idx["Gyro.z"]], dtype=np.int64)
+            acc_norm_idx = name_to_idx["Acc.norm"] if "Acc.norm" in name_to_idx and name_to_idx["Acc.norm"] < n_channels else None
+            gyro_norm_idx = name_to_idx["Gyro.norm"] if "Gyro.norm" in name_to_idx and name_to_idx["Gyro.norm"] < n_channels else None
+            return acc_idx, gyro_idx, acc_norm_idx, gyro_norm_idx
+
+        if n_channels >= 6:
+            acc_norm_idx = 7 if n_channels > 7 else None
+            gyro_norm_idx = 8 if n_channels > 8 else None
+            return np.array([0, 1, 2], dtype=np.int64), np.array([3, 4, 5], dtype=np.int64), acc_norm_idx, gyro_norm_idx
+
+        return None, None, None, None
+
+    def _build_rotation_matrices(self, n_samples, max_rotation_degrees, rotation_plane):
+        rotation_limit = np.deg2rad(float(max_rotation_degrees))
+        plane = str(rotation_plane).strip().lower()
+        if plane not in {"xyz", "xy", "xz", "yz"}:
+            plane = "xyz"
+
+        if plane == "xyz":
+            angles = self.rng.uniform(-rotation_limit, rotation_limit, size=(n_samples, 3)).astype(np.float32)
+        elif plane == "xy":
+            angles = np.zeros((n_samples, 3), dtype=np.float32)
+            angles[:, 2] = self.rng.uniform(-rotation_limit, rotation_limit, size=n_samples).astype(np.float32)
+        elif plane == "xz":
+            angles = np.zeros((n_samples, 3), dtype=np.float32)
+            angles[:, 1] = self.rng.uniform(-rotation_limit, rotation_limit, size=n_samples).astype(np.float32)
+        else:
+            angles = np.zeros((n_samples, 3), dtype=np.float32)
+            angles[:, 0] = self.rng.uniform(-rotation_limit, rotation_limit, size=n_samples).astype(np.float32)
+
+        ax, ay, az = angles[:, 0], angles[:, 1], angles[:, 2]
+        cos_x, sin_x = np.cos(ax), np.sin(ax)
+        cos_y, sin_y = np.cos(ay), np.sin(ay)
+        cos_z, sin_z = np.cos(az), np.sin(az)
+
+        matrices = np.empty((n_samples, 3, 3), dtype=np.float32)
+        matrices[:, 0, 0] = cos_y * cos_z
+        matrices[:, 0, 1] = cos_z * sin_x * sin_y - cos_x * sin_z
+        matrices[:, 0, 2] = sin_x * sin_z + cos_x * cos_z * sin_y
+        matrices[:, 1, 0] = cos_y * sin_z
+        matrices[:, 1, 1] = cos_x * cos_z + sin_x * sin_y * sin_z
+        matrices[:, 1, 2] = cos_x * sin_y * sin_z - cos_z * sin_x
+        matrices[:, 2, 0] = -sin_y
+        matrices[:, 2, 1] = cos_y * sin_x
+        matrices[:, 2, 2] = cos_x * cos_y
+        return matrices
+
+    def _apply_rotation_3d(self, X):
+        X_in = np.asarray(X, dtype=np.float32)
+        if X_in.ndim != 3 or len(X_in) == 0:
+            return X_in
+
+        n, t, c = X_in.shape
+        acc_idx, gyro_idx, acc_norm_idx, gyro_norm_idx = self._resolve_rotation_indices(c)
+        if acc_idx is None or gyro_idx is None:
+            return X_in
+
+        use_scaler = self._input_scaler is not None and hasattr(self._input_scaler, "inverse_transform") and hasattr(self._input_scaler, "transform")
+        if use_scaler:
+            flat = X_in.reshape(-1, c)
+            unscaled = self._input_scaler.inverse_transform(flat).reshape(n, t, c).astype(np.float32, copy=False)
+        else:
+            unscaled = X_in.copy()
+
+        rot_matrices = self._build_rotation_matrices(
+            n_samples=n,
+            max_rotation_degrees=self.rotation_max_degrees,
+            rotation_plane=self.rotation_plane,
+        )
+
+        acc_data = unscaled[:, :, acc_idx]
+        gyro_data = unscaled[:, :, gyro_idx]
+        rotated_acc = np.einsum("nij,ntj->nti", rot_matrices, acc_data)
+        rotated_gyro = np.einsum("nij,ntj->nti", rot_matrices, gyro_data)
+
+        unscaled[:, :, acc_idx] = rotated_acc
+        unscaled[:, :, gyro_idx] = rotated_gyro
+        if acc_norm_idx is not None:
+            unscaled[:, :, acc_norm_idx] = np.linalg.norm(rotated_acc, axis=2)
+        if gyro_norm_idx is not None:
+            unscaled[:, :, gyro_norm_idx] = np.linalg.norm(rotated_gyro, axis=2)
+
+        if use_scaler:
+            flat = unscaled.reshape(-1, c)
+            scaled = self._input_scaler.transform(flat).reshape(n, t, c)
+            return np.ascontiguousarray(scaled, dtype=np.float32)
+        return np.ascontiguousarray(unscaled, dtype=np.float32)
+
+    def _augment_windows_only(self, base_x, method, rng):
+        X = np.asarray(base_x, dtype=np.float32)
+        if method == "jitter":
+            noise = rng.normal(0.0, self.augment_noise_ratio, size=X.shape).astype(np.float32)
+            std = np.std(X, axis=1, keepdims=True).astype(np.float32)
+            std = np.maximum(std, 1e-6)
+            return X + noise * std
+
+        if method == "scaling":
+            scale = rng.normal(1.0, self.augment_noise_ratio, size=(X.shape[0], 1, X.shape[2])).astype(np.float32)
+            return X * scale
+
+        if method == "rotation":
+            return self._apply_rotation_3d(X)
+
+        if method == "basic":
+            out = self._augment_windows_only(X, "jitter", rng)
+            out = self._augment_windows_only(out, "scaling", rng)
+            out = self._augment_windows_only(out, "rotation", rng)
+            return out
+
+        return X
+
+    def _augment_pairwise(self, base_x, base_y, method, rng):
+        X = np.asarray(base_x, dtype=np.float32)
+        y = np.asarray(base_y)
+        n = len(X)
+        if n == 0:
+            return X, y
+        if n == 1:
+            return self._augment_windows_only(X, "jitter", rng), y
+
+        perm = rng.permutation(n)
+        partner_x = X[perm]
+        partner_y = y[perm]
+
+        if method == "mixup":
+            lam = rng.beta(self.mixup_alpha, self.mixup_alpha, size=(n, 1, 1)).astype(np.float32)
+            out_x = lam * X + (1.0 - lam) * partner_x
+            out_y = np.maximum(y, partner_y)
+            return out_x.astype(np.float32), out_y
+
+        if method == "cutmix":
+            out_x = X.copy()
+            t = X.shape[1]
+            cut_len = max(1, int(t * self.cutmix_ratio))
+            starts = rng.randint(0, max(1, t - cut_len + 1), size=n)
+            for i in range(n):
+                s = int(starts[i])
+                e = s + cut_len
+                out_x[i, s:e, :] = partner_x[i, s:e, :]
+            out_y = np.maximum(y, partner_y)
+            return out_x.astype(np.float32), out_y
+
+        if method == "smote":
+            lam = rng.uniform(0.0, 1.0, size=(n, 1, 1)).astype(np.float32)
+            out_x = X + lam * (partner_x - X)
+            out_y = np.maximum(y, partner_y)
+            return out_x.astype(np.float32), out_y
+
+        out_x = self._augment_windows_only(X, method, rng)
+        return out_x.astype(np.float32), y
+
     def _select_augment_mask(self, y_2d):
         target = self.augment_target.strip().lower()
         if target in {"multilabel", "multi_label", "multi-label", "multi"}:
@@ -235,6 +424,8 @@ class XGBoostClassifierSK:
             return X, y_2d
         if len(X) == 0:
             return X, y_2d
+        if not self.augment_methods:
+            return X, y_2d
 
         mask = self._select_augment_mask(y_2d)
         idx = np.where(mask)[0]
@@ -248,22 +439,27 @@ class XGBoostClassifierSK:
         base_x = np.asarray(X[idx], dtype=np.float32)
         base_y = np.asarray(y_2d[idx], dtype=y_2d.dtype)
 
-        rep = int(self.augment_count)
-        aug_x = np.repeat(base_x, rep, axis=0)
-        aug_y = np.repeat(base_y, rep, axis=0)
-
         rng = np.random.RandomState(self.random_state)
-        noise = rng.normal(0.0, self.augment_noise_ratio, size=aug_x.shape).astype(np.float32)
+        aug_x_parts = []
+        aug_y_parts = []
+        rep = int(self.augment_count)
+        for rep_idx in range(rep):
+            method = self.augment_methods[rep_idx % len(self.augment_methods)]
+            if method in {"mixup", "cutmix", "smote"}:
+                aug_x_rep, aug_y_rep = self._augment_pairwise(base_x, base_y, method, rng)
+            else:
+                aug_x_rep = self._augment_windows_only(base_x, method, rng)
+                aug_y_rep = base_y
+            aug_x_parts.append(np.asarray(aug_x_rep, dtype=np.float32))
+            aug_y_parts.append(np.asarray(aug_y_rep, dtype=base_y.dtype))
 
-        sample_std = np.std(base_x, axis=1, keepdims=True).astype(np.float32)
-        sample_std = np.maximum(sample_std, 1e-6)
-        sample_std = np.repeat(sample_std, rep, axis=0)
-        aug_x = aug_x + noise * sample_std
+        aug_x = np.concatenate(aug_x_parts, axis=0)
+        aug_y = np.concatenate(aug_y_parts, axis=0)
 
         out_x = np.concatenate([X.astype(np.float32, copy=False), aug_x], axis=0)
         out_y = np.concatenate([y_2d, aug_y], axis=0)
         print(
-            f"[Augment] target={self.augment_target}, per_sample={rep}, "
+            f"[Augment] methods={','.join(self.augment_methods)}, target={self.augment_target}, per_sample={rep}, "
             f"matched={len(base_x)}, added={len(aug_x)}, total={len(out_x)}"
         )
         return out_x, out_y
@@ -320,29 +516,7 @@ class XGBoostClassifierSK:
         gc.collect()
         print("Training done.")
 
-    def predict(self, test_X):
-        test_X = self._maybe_downsample_windows(test_X)
-        if not self.models:
-            raise RuntimeError("Model has not been trained yet.")
-
-        base_feat = None
-        if not self.signal_combo_map:
-            base_feat = self._extract_features(test_X)
-
-        per_label_preds = []
-        for label_idx, model in enumerate(self.models):
-            if base_feat is not None:
-                feat = base_feat
-            else:
-                label_X = self._select_windows_for_label(test_X, label_idx)
-                feat = self._extract_features(label_X)
-            per_label_preds.append(model.predict(feat))
-
-        predictions = np.column_stack(per_label_preds).astype(int)
-        return predictions
-
-    def predict_proba(self, test_X):
-        test_X = self._maybe_downsample_windows(test_X)
+    def _predict_proba_single(self, test_X):
         if not self.models:
             raise RuntimeError("Model has not been trained yet.")
 
@@ -360,6 +534,32 @@ class XGBoostClassifierSK:
             per_label_prob = model.predict_proba(feat)
             probs.append(per_label_prob[:, 1])
         return np.column_stack(probs)
+
+    def _build_tta_views(self, test_X):
+        views = [np.asarray(test_X, dtype=np.float32)]
+        if self.tta_count <= 0 or not self.tta_methods:
+            return views
+        rng = np.random.RandomState(self.random_state + 123)
+        for i in range(int(self.tta_count)):
+            method = self.tta_methods[i % len(self.tta_methods)]
+            if method in {"mixup", "cutmix", "smote"}:
+                aug_x, _ = self._augment_pairwise(views[0], np.zeros((len(views[0]), 1), dtype=np.int8), method, rng)
+                views.append(np.asarray(aug_x, dtype=np.float32))
+            else:
+                views.append(np.asarray(self._augment_windows_only(views[0], method, rng), dtype=np.float32))
+        return views
+
+    def predict(self, test_X):
+        probs = self.predict_proba(test_X)
+        return (probs >= 0.5).astype(int)
+
+    def predict_proba(self, test_X):
+        test_X = self._maybe_downsample_windows(test_X)
+        views = self._build_tta_views(test_X)
+        probs_list = [self._predict_proba_single(view) for view in views]
+        if len(probs_list) == 1:
+            return probs_list[0]
+        return np.mean(np.stack(probs_list, axis=0), axis=0)
 
     def get_feature_importance(self, importance_type="gain"):
         if not self.models:
