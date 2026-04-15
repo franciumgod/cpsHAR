@@ -40,6 +40,9 @@ class XGBoostClassifierSK:
         tta_samples=False,
         tta_method="jitter",
         feature_engineering=True,
+        use_tsfresh=False,
+        feature_domain="time",
+        spectrum_method="rfft",
     ):
         self.classes = classes
         self.use_val_in_train = use_val_in_train
@@ -75,6 +78,17 @@ class XGBoostClassifierSK:
             "y",
             "on",
         }
+        self.use_tsfresh = str(use_tsfresh).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        }
+        self.feature_domain = str(feature_domain).strip().lower()
+        if self.feature_domain not in {"time", "freq", "time_freq"}:
+            self.feature_domain = "time"
+        self.spectrum_method = self._normalize_spectrum_method(spectrum_method)
 
         self._model_params = {
             "n_estimators": n_estimators,
@@ -123,6 +137,20 @@ class XGBoostClassifierSK:
         methods = [p for p in parts if p in valid]
         return methods if methods else ([default] if default else [])
 
+    @staticmethod
+    def _normalize_spectrum_method(value):
+        text = str(value).strip().lower()
+        compact = text.replace(" ", "").replace("-", "").replace("_", "")
+        if compact in {"rfft", "fft"}:
+            return "rfft"
+        if compact in {"welch", "welchpsd", "psd"}:
+            return "welch_psd"
+        if compact in {"stft"}:
+            return "stft"
+        if compact in {"dwt", "wavelet"}:
+            return "dwt"
+        return "rfft"
+
     def set_input_scaler(self, scaler):
         self._input_scaler = scaler
 
@@ -168,23 +196,7 @@ class XGBoostClassifierSK:
             X_ds = np.transpose(X_ds, (0, 2, 1))
         return X_ds.astype(np.float32, copy=False)
 
-    def _extract_features(self, X):
-        """
-        Input:
-            X: shape = (n_samples, time_steps, n_channels)
-               or (n_samples, n_channels, time_steps)
-
-        Output:
-            shape = (n_samples, n_features_2d)
-        """
-        X = np.asarray(X, dtype=np.float32)
-
-        if X.ndim != 3:
-            raise ValueError(f"Expected 3D input, but got shape {X.shape}")
-
-        if X.shape[1] < X.shape[2]:
-            X = np.transpose(X, (0, 2, 1))
-
+    def _extract_time_features(self, X):
         mean = np.mean(X, axis=1, dtype=np.float32)
         std = np.std(X, axis=1, dtype=np.float32)
         max_val = np.max(X, axis=1)
@@ -192,7 +204,6 @@ class XGBoostClassifierSK:
 
         feat_blocks = [mean, std, max_val, min_val]
         if self.feature_engineering:
-            # RMS and RMSE-style window summaries per channel.
             rms = np.sqrt(np.mean(X * X, axis=1, dtype=np.float32))
             centered = X - mean[:, None, :]
             rmse = np.sqrt(np.mean(centered * centered, axis=1, dtype=np.float32))
@@ -210,9 +221,159 @@ class XGBoostClassifierSK:
                 lag_blocks.append(X[:, lag_idx, :])
 
             feat_blocks.extend([rms, rmse, diff_1_mean] + lag_blocks)
+        return np.hstack(feat_blocks).astype(np.float32)
 
-        features = np.hstack(feat_blocks).astype(np.float32)
-        return features
+    def _build_rfft_spectrum(self, X):
+        spectrum = np.fft.rfft(X, axis=1)
+        return np.abs(spectrum).astype(np.float32, copy=False)
+
+    def _build_welch_psd_spectrum(self, X):
+        n, t, _ = X.shape
+        if t < 4:
+            return self._build_rfft_spectrum(X)
+
+        nperseg = min(256, t)
+        step = max(1, nperseg // 2)
+        starts = list(range(0, t - nperseg + 1, step))
+        if not starts:
+            starts = [0]
+
+        window = np.hanning(nperseg).astype(np.float32)
+        win_norm = float(np.sum(window * window) + 1e-8)
+        psd_acc = None
+
+        for s in starts:
+            seg = X[:, s:s + nperseg, :] * window[None, :, None]
+            fft = np.fft.rfft(seg, axis=1)
+            psd = (np.abs(fft) ** 2).astype(np.float32, copy=False) / win_norm
+            psd_acc = psd if psd_acc is None else (psd_acc + psd)
+
+        return (psd_acc / float(len(starts))).astype(np.float32, copy=False)
+
+    def _build_stft_spectrum(self, X):
+        n, t, _ = X.shape
+        if t < 4:
+            return self._build_rfft_spectrum(X)
+
+        nperseg = min(256, t)
+        step = max(1, nperseg // 2)
+        starts = list(range(0, t - nperseg + 1, step))
+        if not starts:
+            starts = [0]
+
+        window = np.hanning(nperseg).astype(np.float32)
+        mags = []
+        for s in starts:
+            seg = X[:, s:s + nperseg, :] * window[None, :, None]
+            fft = np.fft.rfft(seg, axis=1)
+            mags.append(np.abs(fft).astype(np.float32, copy=False))
+
+        stacked = np.stack(mags, axis=1)  # (n, frames, bins, c)
+        return np.mean(stacked, axis=1, dtype=np.float32)
+
+    def _build_dwt_spectrum(self, X):
+        n, t, c = X.shape
+        if t < 2:
+            return np.abs(X).astype(np.float32, copy=False)
+
+        even_t = t - (t % 2)
+        paired = X[:, :even_t, :].reshape(n, even_t // 2, 2, c)
+        approx = (paired[:, :, 0, :] + paired[:, :, 1, :]) / np.sqrt(2.0)
+        detail = (paired[:, :, 0, :] - paired[:, :, 1, :]) / np.sqrt(2.0)
+        coeff = np.concatenate([np.abs(approx), np.abs(detail)], axis=1).astype(np.float32, copy=False)
+
+        if t % 2 == 1:
+            tail = np.abs(X[:, -1:, :]).astype(np.float32, copy=False)
+            coeff = np.concatenate([coeff, tail], axis=1)
+        return coeff
+
+    def _build_spectrum(self, X):
+        method = self.spectrum_method
+        if method == "welch_psd":
+            return self._build_welch_psd_spectrum(X)
+        if method == "stft":
+            return self._build_stft_spectrum(X)
+        if method == "dwt":
+            return self._build_dwt_spectrum(X)
+        return self._build_rfft_spectrum(X)
+
+    def _extract_freq_features(self, X):
+        mag = self._build_spectrum(X)
+
+        mean = np.mean(mag, axis=1, dtype=np.float32)
+        std = np.std(mag, axis=1, dtype=np.float32)
+        max_val = np.max(mag, axis=1)
+        min_val = np.min(mag, axis=1)
+        energy = np.mean(mag * mag, axis=1, dtype=np.float32)
+
+        freqs = np.linspace(0.0, 1.0, num=mag.shape[1], dtype=np.float32)
+        denom = np.sum(mag, axis=1, dtype=np.float32) + 1e-8
+        centroid = np.sum(mag * freqs[None, :, None], axis=1, dtype=np.float32) / denom
+        spread = np.sqrt(
+            np.sum(
+                ((freqs[None, :, None] - centroid[:, None, :]) ** 2) * mag,
+                axis=1,
+                dtype=np.float32,
+            ) / denom
+        ).astype(np.float32, copy=False)
+
+        return np.hstack([mean, std, max_val, min_val, energy, centroid, spread]).astype(np.float32)
+
+    def _extract_tsfresh_features(self, X):
+        import pandas as pd
+        from tsfresh import extract_features
+        from tsfresh.feature_extraction import EfficientFCParameters
+
+        n, t, c = X.shape
+        if n == 0:
+            return np.empty((0, 0), dtype=np.float32)
+
+        ids = np.repeat(np.arange(n, dtype=np.int32), t * c)
+        times = np.tile(np.repeat(np.arange(t, dtype=np.int32), c), n)
+        kinds = np.tile(np.arange(c, dtype=np.int16), n * t)
+        values = X.reshape(-1).astype(np.float32, copy=False)
+
+        long_df = pd.DataFrame(
+            {
+                "id": ids,
+                "time": times,
+                "kind": kinds,
+                "value": values,
+            }
+        )
+        feat_df = extract_features(
+            long_df,
+            column_id="id",
+            column_sort="time",
+            column_kind="kind",
+            column_value="value",
+            default_fc_parameters=EfficientFCParameters(),
+            disable_progressbar=True,
+            n_jobs=0,
+        )
+        feat_df = feat_df.sort_index().fillna(0.0)
+        return feat_df.to_numpy(dtype=np.float32, copy=False)
+
+    def _extract_features(self, X):
+        X = np.asarray(X, dtype=np.float32)
+
+        if X.ndim != 3:
+            raise ValueError(f"Expected 3D input, but got shape {X.shape}")
+
+        if X.shape[1] < X.shape[2]:
+            X = np.transpose(X, (0, 2, 1))
+
+        feat_blocks = []
+        if self.feature_domain in {"time", "time_freq"}:
+            feat_blocks.append(self._extract_time_features(X))
+        if self.feature_domain in {"freq", "time_freq"}:
+            feat_blocks.append(self._extract_freq_features(X))
+        if self.use_tsfresh:
+            feat_blocks.append(self._extract_tsfresh_features(X))
+
+        if not feat_blocks:
+            feat_blocks.append(self._extract_time_features(X))
+        return np.hstack(feat_blocks).astype(np.float32)
 
     def _extract_features_batched(self, X):
         X = np.asarray(X)
@@ -498,7 +659,9 @@ class XGBoostClassifierSK:
         print(
             f"Start training multi-label XGBoost with {split_name}: "
             f"{sampled_X.shape[0]} samples, "
-            f"{y_fit_2d.shape[1]} labels..."
+            f"{y_fit_2d.shape[1]} labels | "
+            f"feature_domain={self.feature_domain}, spectrum_method={self.spectrum_method}, "
+            f"use_tsfresh={self.use_tsfresh}..."
         )
 
         self.models = []

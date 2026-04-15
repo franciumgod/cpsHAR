@@ -107,6 +107,20 @@ def _safe_ratio_matrix(ratio, y):
     return ratio_arr
 
 
+def print_key_run_params(args, resolved_dataset_file):
+    def on_off(v):
+        return "ON" if parse_bool_arg(v, default=False) else "OFF"
+
+    print("\n=== Key Params ===")
+    print(f"data           : {args.data} -> {resolved_dataset_file}")
+    print(f"train_with_val : {on_off(args.train_with_val)}")
+    print(f"signal_combo   : {on_off(args.signal_combo)}")
+    print(f"feature_engine : {on_off(args.feature_engineering)}")
+    print(f"feature_domain : {str(getattr(args, 'feature_domain', 'time')).strip().lower()}")
+    print(f"spectrum_method: {str(getattr(args, 'spectrum_method', 'rfft')).strip().lower()}")
+    print("==================\n")
+
+
 if __name__ == '__main__':
     import argparse
 
@@ -176,6 +190,25 @@ if __name__ == '__main__':
         "--feature_engineering",
         default=False,
         help="Enable additional engineered features: RMS, RMSE, first-order diff, and lags (1,3,5,10)."
+    )
+    parser.add_argument(
+        "--use_tsfresh",
+        default=False,
+        help="Enable tsfresh feature extraction and append tsfresh features to model input."
+    )
+    parser.add_argument(
+        "--feature_domain",
+        type=str,
+        default="time",
+        choices=["time", "freq", "time_freq"],
+        help="Feature domain for handcrafted features: time (default), freq, or time_freq."
+    )
+    parser.add_argument(
+        "--spectrum_method",
+        type=str,
+        default="rfft",
+        help="Frequency-spectrum generator when feature_domain includes freq. "
+             "Supported: rfft, welch_psd, stft, dwt."
     )
     parser.add_argument(
         "--sample_augment",
@@ -393,6 +426,7 @@ if __name__ == '__main__':
     enable_sample_stats = parse_bool_arg(args.sample_stats, default=False)
     preprocess_order = "subsample_first"
     print("Preprocess order: subsample_first")
+    print_key_run_params(args, config.data.dataset_file)
 
     SEED = 42
     random.seed(SEED)

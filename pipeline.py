@@ -141,6 +141,9 @@ def build_model(
     augment_method = str(getattr(args, "augment_method", "jitter")).strip().lower()
     tta_count = parse_augment_count(getattr(args, "tta", False))
     tta_method = str(getattr(args, "tta_method", "jitter")).strip().lower()
+    use_tsfresh = parse_bool_arg(getattr(args, "use_tsfresh", False), default=False)
+    feature_domain = str(getattr(args, "feature_domain", "time")).strip().lower()
+    spectrum_method = str(getattr(args, "spectrum_method", "rfft")).strip().lower()
     signal_combo_map = (
         build_special_signal_combo_map(config.data.sensor_cols) if use_signal_combo else None
     )
@@ -183,6 +186,9 @@ def build_model(
             feature_engineering=parse_bool_arg(
                 getattr(args, "feature_engineering", False), default=False
             ),
+            use_tsfresh=use_tsfresh,
+            feature_domain=feature_domain,
+            spectrum_method=spectrum_method,
         )
 
     return XGBoostClassifierSK(
@@ -209,4 +215,7 @@ def build_model(
         feature_engineering=parse_bool_arg(
             getattr(args, "feature_engineering", False), default=False
         ),
+        use_tsfresh=use_tsfresh,
+        feature_domain=feature_domain,
+        spectrum_method=spectrum_method,
     )
