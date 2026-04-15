@@ -48,6 +48,7 @@ def apply_superclass_mapping(df, mapping):
 
 def build_manifest_for_step(raw_meta, config, window_size, step):
     final_target_cols = sorted(list(set(config.data.superclass_mapping.values())))
+    ratio_cols = [f"{name}__ratio_pre_ds" for name in final_target_cols]
     manifest_parts = []
 
     for source_index, row in raw_meta.iterrows():
@@ -59,7 +60,12 @@ def build_manifest_for_step(raw_meta, config, window_size, step):
 
         starts = np.arange(0, len(sample_df) - window_size + 1, step, dtype=np.int32)
         ends = starts + np.int32(window_size)
-        labels = sample_df.iloc[ends - 1][final_target_cols].to_numpy(dtype=np.int8, copy=False)
+        label_values = sample_df[final_target_cols].to_numpy(dtype=np.int8, copy=False)
+        labels = label_values[ends - 1]
+        prefix = np.zeros((len(sample_df) + 1, len(final_target_cols)), dtype=np.int64)
+        if len(sample_df) > 0:
+            prefix[1:] = np.cumsum(label_values, axis=0, dtype=np.int64)
+        ratio_pre_ds = (prefix[ends] - prefix[starts]).astype(np.float32) / float(window_size)
 
         part = pd.DataFrame(
             {
@@ -72,6 +78,7 @@ def build_manifest_for_step(raw_meta, config, window_size, step):
         )
         for label_idx, label_name in enumerate(final_target_cols):
             part[label_name] = labels[:, label_idx].astype(np.int8, copy=False)
+            part[ratio_cols[label_idx]] = ratio_pre_ds[:, label_idx].astype(np.float32, copy=False)
         manifest_parts.append(part)
 
         print(
@@ -92,6 +99,7 @@ def build_manifest_for_step(raw_meta, config, window_size, step):
         "step_size": step,
         "sensor_cols": list(config.data.sensor_cols),
         "label_cols": final_target_cols,
+        "label_ratio_cols": ratio_cols,
         "samples": manifest,
     }
     return payload
@@ -128,6 +136,7 @@ def build_materialized_windows_for_step(raw_meta, config, window_size, step):
 
     X = np.empty((total_windows, window_size, n_channels), dtype=np.float32)
     y = np.empty((total_windows, n_labels), dtype=np.int8)
+    label_ratio_pre_ds = np.empty((total_windows, n_labels), dtype=np.float32)
     experiment = np.empty(total_windows, dtype=np.int16)
     scenario = np.empty(total_windows, dtype=np.int16)
     source_indices = np.empty(total_windows, dtype=np.int32)
@@ -137,6 +146,9 @@ def build_materialized_windows_for_step(raw_meta, config, window_size, step):
     for source_index, scenario_id, experiment_id, sample_df, n_windows in source_cache:
         sensor_values = sample_df[sensor_cols].to_numpy(dtype=np.float32, copy=False)
         label_values = sample_df[final_target_cols].to_numpy(dtype=np.int8, copy=False)
+        prefix = np.zeros((len(sample_df) + 1, n_labels), dtype=np.int64)
+        if len(sample_df) > 0:
+            prefix[1:] = np.cumsum(label_values, axis=0, dtype=np.int64)
         starts = np.arange(0, len(sample_df) - window_size + 1, step, dtype=np.int32)
 
         batch_size = 256
@@ -147,6 +159,10 @@ def build_materialized_windows_for_step(raw_meta, config, window_size, step):
             idx_matrix = batch_starts[:, None] + np.arange(window_size, dtype=np.int32)[None, :]
             X[write_pos: write_pos + batch_len] = sensor_values[idx_matrix]
             y[write_pos: write_pos + batch_len] = label_values[batch_starts + window_size - 1]
+            sums = prefix[batch_starts + window_size] - prefix[batch_starts]
+            label_ratio_pre_ds[write_pos: write_pos + batch_len] = (
+                sums.astype(np.float32) / float(window_size)
+            ).astype(np.float32, copy=False)
             experiment[write_pos: write_pos + batch_len] = experiment_id
             scenario[write_pos: write_pos + batch_len] = scenario_id
             source_indices[write_pos: write_pos + batch_len] = source_index
@@ -167,6 +183,7 @@ def build_materialized_windows_for_step(raw_meta, config, window_size, step):
         "step_size": step,
         "sensor_cols": sensor_cols,
         "label_cols": final_target_cols,
+        "label_ratio_pre_ds": label_ratio_pre_ds,
         "X": X,
         "y": y,
         "experiment": experiment,

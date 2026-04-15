@@ -13,6 +13,12 @@ from utils.utils import (
 from utils.config import Config
 from data_handler import DataHandler
 from optuna_tuner import tune_hyperparameters_for_fold
+from sample_stats import (
+    compute_dataset_label_ratio_stats,
+    build_fold_classifier_input_stats,
+    print_dataset_label_ratio_stats,
+    print_fold_classifier_input_stats,
+)
 from pipeline import (
     resolve_dataset_file,
     parse_bool_arg,
@@ -84,6 +90,21 @@ def print_fold_data_overview(train, val, test, class_names):
         for class_name, class_pos in rows:
             print(f"  - {class_name}: {class_pos}")
         print(f"  - Multilabel(>1 active labels): {multi_label_count}")
+
+
+def _safe_ratio_matrix(ratio, y):
+    y_arr = np.asarray(y)
+    if y_arr.ndim == 1:
+        y_arr = y_arr.reshape(-1, 1)
+    if ratio is None:
+        return y_arr.astype(np.float32, copy=False)
+
+    ratio_arr = np.asarray(ratio, dtype=np.float32)
+    if ratio_arr.ndim == 1:
+        ratio_arr = ratio_arr.reshape(-1, 1)
+    if ratio_arr.shape != y_arr.shape:
+        return y_arr.astype(np.float32, copy=False)
+    return ratio_arr
 
 
 if __name__ == '__main__':
@@ -240,6 +261,12 @@ if __name__ == '__main__':
         help="Remove multi-label samples from training set (keep samples with <=1 active label)."
     )
     parser.add_argument(
+        "--sample_stats",
+        default=False,
+        help="Enable sample statistics collection and printing. "
+             "Stats are written into run_summary.json together with training/testing results."
+    )
+    parser.add_argument(
         "--driving_pos_threshold",
         type=float,
         default=None,
@@ -363,6 +390,7 @@ if __name__ == '__main__':
     config = Config()
     config.data.dataset_file = resolve_dataset_file(args.data)
     show_images = parse_bool_arg(args.show_images, default=False)
+    enable_sample_stats = parse_bool_arg(args.sample_stats, default=False)
     preprocess_order = "subsample_first"
     print("Preprocess order: subsample_first")
 
@@ -388,9 +416,11 @@ if __name__ == '__main__':
         "resolved_dataset_file": config.data.dataset_file,
         "preprocess_order": preprocess_order,
         "arguments": vars(args),
+        "sample_stats": {"enabled": enable_sample_stats},
         "folds": [],
         "aggregate": {},
     }
+    dataset_level_sample_stats = None
 
     # load data
     datahandler = DataHandler(
@@ -433,6 +463,31 @@ if __name__ == '__main__':
 
         train, val, test, target_vals = datahandler.get_data_loaders()
         print_fold_data_overview(train, val, test, target_vals)
+        split_ratio_pre_ds = datahandler.get_last_split_ratio_pre_ds()
+        fold_sample_stats = None
+
+        if enable_sample_stats and dataset_level_sample_stats is None:
+            dataset_level_sample_stats = compute_dataset_label_ratio_stats(datahandler, target_vals)
+            run_summary["sample_stats"]["dataset_level"] = dataset_level_sample_stats
+            print_dataset_label_ratio_stats(dataset_level_sample_stats)
+
+        if enable_sample_stats:
+            train_ratio = _safe_ratio_matrix(split_ratio_pre_ds.get("train"), train[1])
+            val_ratio = _safe_ratio_matrix(split_ratio_pre_ds.get("val"), val[1])
+            include_val_in_train = parse_bool_arg(args.train_with_val, default=False)
+            if include_val_in_train:
+                y_for_stats = np.concatenate([np.asarray(train[1]), np.asarray(val[1])], axis=0)
+                ratio_for_stats = np.concatenate([train_ratio, val_ratio], axis=0)
+            else:
+                y_for_stats = np.asarray(train[1])
+                ratio_for_stats = train_ratio
+
+            fold_sample_stats = build_fold_classifier_input_stats(
+                y_train=y_for_stats,
+                ratio_pre_ds_train=ratio_for_stats,
+                class_names=target_vals,
+            )
+            print_fold_classifier_input_stats(fold, fold_sample_stats, target_vals)
 
         try:
 
@@ -541,6 +596,7 @@ if __name__ == '__main__':
                         "min_data_in_leaf": getattr(fold_args, "min_data_in_leaf", None),
                     },
                     "optuna": optuna_result,
+                    "sample_stats": fold_sample_stats if enable_sample_stats else None,
                 }
             )
 
@@ -589,6 +645,12 @@ if __name__ == '__main__':
         "avg_macro_brier": float(np.mean(macro_briers)) if macro_briers else None,
         "overall_plots": overall_plot_paths,
     }
+    if enable_sample_stats:
+        run_summary["aggregate"]["sample_stats"] = {
+            "enabled": True,
+            "dataset_level_available": dataset_level_sample_stats is not None,
+            "fold_stats_count": int(len(run_summary["folds"])),
+        }
 
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)

@@ -43,6 +43,7 @@ class DataHandler:
         self.sample_manifest_meta = {}
         self.raw_source_data = None
         self._source_segment_cache = {}
+        self.last_split_ratio_pre_ds = {}
 
         self._load_data_set()
 
@@ -62,6 +63,9 @@ class DataHandler:
     def _get_merged_data(self, meta_subset):
         merged = [row["data"] for _, row in meta_subset.iterrows()]
         return pd.concat(merged, ignore_index=True) if merged else pd.DataFrame()
+
+    def get_last_split_ratio_pre_ds(self):
+        return dict(self.last_split_ratio_pre_ds)
 
     def _clean(self, df):
         cols_to_drop = ["Error", "Synchronization", "None", "transportation", "container"]
@@ -93,7 +97,17 @@ class DataHandler:
         min_len = min(len(X_view), len(y_view))
         X_view = X_view[:min_len]
         y_view = y_view[:min_len]
-        return X_view, y_view
+        if min_len == 0:
+            ratio_view = np.empty((0, len(label_cols)), dtype=np.float32)
+            return X_view, y_view, ratio_view
+
+        starts = np.arange(0, min_len, dtype=np.int64)
+        prefix = np.zeros((len(label_values) + 1, len(label_cols)), dtype=np.int64)
+        if len(label_values) > 0:
+            prefix[1:] = np.cumsum(label_values, axis=0, dtype=np.int64)
+        sums = prefix[starts + seq_len] - prefix[starts]
+        ratio_view = (sums.astype(np.float32) / float(seq_len)).astype(np.float32, copy=False)
+        return X_view, y_view, ratio_view
 
     def _detect_dataset_kind(self, payload):
         if isinstance(payload, dict) and payload.get("kind") == "sample_manifest":
@@ -270,19 +284,27 @@ class DataHandler:
 
         return np.arange(total_windows, dtype=np.int64)
 
-    def _maybe_subsample_window_samples(self, X, y, split_name, apply_subsample):
+    def _maybe_subsample_window_samples(
+        self,
+        X,
+        y,
+        split_name,
+        apply_subsample,
+        ratio_pre_ds=None,
+    ):
         if not apply_subsample:
-            return X, y
+            return X, y, ratio_pre_ds
 
         idx = self._select_subsample_indices(len(X), apply_subsample=True)
         if len(idx) == len(X):
             print(f"Subsample [{split_name}] windows: total={len(X)} -> kept={len(X)}")
-            return X, y
+            return X, y, ratio_pre_ds
 
         X_sub = X[idx]
         y_sub = y[idx]
+        ratio_sub = ratio_pre_ds[idx] if ratio_pre_ds is not None else None
         print(f"Subsample [{split_name}] windows: total={len(X)} -> kept={len(X_sub)}")
-        return X_sub, y_sub
+        return X_sub, y_sub, ratio_sub
 
     def _build_train_filter_mask(self, y, label_cols, split_name):
         y_arr = np.asarray(y)
@@ -335,17 +357,26 @@ class DataHandler:
 
         return keep_mask
 
-    def _apply_post_subsample_filters(self, X, y, label_cols, split_name, apply_filters=True):
+    def _apply_post_subsample_filters(
+        self,
+        X,
+        y,
+        label_cols,
+        split_name,
+        apply_filters=True,
+        ratio_pre_ds=None,
+    ):
         before = len(X)
         if not apply_filters:
-            return X, y
+            return X, y, ratio_pre_ds
 
         keep_mask = self._build_train_filter_mask(y, label_cols=label_cols, split_name=split_name)
         X = X[keep_mask]
         y = y[keep_mask]
+        ratio = ratio_pre_ds[keep_mask] if ratio_pre_ds is not None else None
         after = len(X)
         print(f"Post-subsample filter [{split_name}]: {before} -> {after} samples")
-        return X, y
+        return X, y, ratio
 
     def _apply_post_subsample_start_filters(
         self,
@@ -391,6 +422,7 @@ class DataHandler:
     ):
         sensor_values = df[sensor_cols].to_numpy(dtype=np.float32, copy=False)
         label_values = df[label_cols].to_numpy(dtype=np.int8, copy=False)
+        n_labels = len(label_cols)
         total_windows = max(0, len(df) - seq_len + 1)
         starts = self._select_subsample_indices(total_windows, apply_subsample=apply_subsample)
         if apply_post_subsample_filters and len(starts) > 0:
@@ -406,11 +438,15 @@ class DataHandler:
         n_samples = len(starts)
         out_len = self._window_len_after_downsample(seq_len) if apply_downsample else seq_len
         X = np.empty((n_samples, out_len, len(sensor_cols)), dtype=np.float32)
-        y = np.empty((n_samples, len(label_cols)), dtype=np.int8)
+        y = np.empty((n_samples, n_labels), dtype=np.int8)
+        ratio_pre_ds = np.empty((n_samples, n_labels), dtype=np.float32)
         if n_samples == 0:
-            return X, y
+            return X, y, ratio_pre_ds
 
         base_steps = np.arange(seq_len, dtype=np.int64)
+        prefix = np.zeros((len(label_values) + 1, n_labels), dtype=np.int64)
+        if len(label_values) > 0:
+            prefix[1:] = np.cumsum(label_values, axis=0, dtype=np.int64)
         batch_size = 256
         write_pos = 0
 
@@ -427,11 +463,15 @@ class DataHandler:
             batch_len = len(batch_starts)
             X[write_pos: write_pos + batch_len] = batch_windows
             y[write_pos: write_pos + batch_len] = batch_labels
+            sums = prefix[batch_starts + seq_len] - prefix[batch_starts]
+            ratio_pre_ds[write_pos: write_pos + batch_len] = (
+                sums.astype(np.float32) / float(seq_len)
+            ).astype(np.float32, copy=False)
             write_pos += batch_len
 
         action = "selected" if apply_subsample else "all"
         print(f"Subsample-first [{split_name}] windows: total={total_windows} -> {action}={n_samples}")
-        return X, y
+        return X, y, ratio_pre_ds
 
     def _fit_and_apply_scaler(self, train_x, val_x, test_x):
         n_channels = train_x.shape[-1]
@@ -469,10 +509,16 @@ class DataHandler:
         if sample_df.empty:
             empty_x = np.empty((0, 0, len(self.config.data.sensor_cols)), dtype=np.float32)
             empty_y = np.empty((0, len(final_target_cols)), dtype=np.int8)
-            return empty_x, empty_y
+            empty_ratio = np.empty((0, len(final_target_cols)), dtype=np.float32)
+            return empty_x, empty_y, empty_ratio
 
         window_size = int(sample_df.iloc[0]["end_idx"] - sample_df.iloc[0]["start_idx"])
         X = np.empty((len(sample_df), window_size, len(self.config.data.sensor_cols)), dtype=np.float32)
+        ratio_pre_ds = np.empty((len(sample_df), len(final_target_cols)), dtype=np.float32)
+        ratio_cols = [f"{name}__ratio_pre_ds" for name in final_target_cols]
+        has_ratio_cols = all(col in sample_df.columns for col in ratio_cols)
+        if has_ratio_cols:
+            ratio_pre_ds = sample_df[ratio_cols].to_numpy(dtype=np.float32, copy=False)
 
         for row_idx, row in enumerate(sample_df.itertuples(index=False)):
             processed_df = self._get_processed_source_df(int(row.source_index), final_target_cols)
@@ -480,9 +526,14 @@ class DataHandler:
                 self.config.data.sensor_cols
             ].to_numpy(dtype=np.float32, copy=False)
             X[row_idx] = sample_values
+            if not has_ratio_cols:
+                label_slice = processed_df.iloc[int(row.start_idx):int(row.end_idx)][
+                    final_target_cols
+                ].to_numpy(dtype=np.float32, copy=False)
+                ratio_pre_ds[row_idx] = np.mean(label_slice, axis=0, dtype=np.float32)
 
         y = sample_df[final_target_cols].to_numpy(dtype=np.int8, copy=False)
-        return X, y
+        return X, y, ratio_pre_ds
 
     def _get_data_loaders_from_raw(self):
         test_mask = self.data["experiment"] == self.config.data.test_experiment_id
@@ -505,7 +556,7 @@ class DataHandler:
 
         if self.preprocess_order == "subsample_first":
             train_seq_len = int(self.config.prep.original_freq * self.config.prep.seq_len_multiplier)
-            train_x, train_y = self._extract_subsampled_windows_batched(
+            train_x, train_y, train_ratio = self._extract_subsampled_windows_batched(
                 train_df,
                 train_seq_len,
                 self.config.data.sensor_cols,
@@ -515,7 +566,7 @@ class DataHandler:
                 apply_downsample=True,
                 apply_post_subsample_filters=True,
             )
-            val_x, val_y = self._extract_subsampled_windows_batched(
+            val_x, val_y, val_ratio = self._extract_subsampled_windows_batched(
                 validation_df,
                 train_seq_len,
                 self.config.data.sensor_cols,
@@ -523,7 +574,7 @@ class DataHandler:
                 "val",
                 apply_subsample=False,
             )
-            test_x, test_y = self._extract_subsampled_windows_batched(
+            test_x, test_y, test_ratio = self._extract_subsampled_windows_batched(
                 test_df,
                 train_seq_len,
                 self.config.data.sensor_cols,
@@ -542,19 +593,19 @@ class DataHandler:
             test_df = self._maybe_downsample(test_df, self.config.data.sensor_cols, final_target_cols, "test")
 
             seq_len = self._get_effective_seq_len_for_raw()
-            train_x, train_y = self._get_challenge_data_numpy(
+            train_x, train_y, train_ratio = self._get_challenge_data_numpy(
                 train_df,
                 seq_len,
                 self.config.data.sensor_cols,
                 final_target_cols,
             )
-            val_x, val_y = self._get_challenge_data_numpy(
+            val_x, val_y, val_ratio = self._get_challenge_data_numpy(
                 validation_df,
                 seq_len,
                 self.config.data.sensor_cols,
                 final_target_cols,
             )
-            test_x, test_y = self._get_challenge_data_numpy(
+            test_x, test_y, test_ratio = self._get_challenge_data_numpy(
                 test_df,
                 seq_len,
                 self.config.data.sensor_cols,
@@ -562,6 +613,11 @@ class DataHandler:
             )
 
         train_x, val_x, test_x = self._fit_and_apply_scaler(train_x, val_x, test_x)
+        self.last_split_ratio_pre_ds = {
+            "train": train_ratio.astype(np.float32, copy=False),
+            "val": val_ratio.astype(np.float32, copy=False),
+            "test": test_ratio.astype(np.float32, copy=False),
+        }
         return (train_x, train_y), (val_x, val_y), (test_x, test_y), final_target_cols
 
     def _get_data_loaders_from_sample_manifest(self):
@@ -573,22 +629,24 @@ class DataHandler:
         validation_manifest = self.data[validation_mask]
 
         final_target_cols = self._get_final_target_cols()
-        train_x, train_y = self._materialize_window_samples(train_manifest, final_target_cols)
-        val_x, val_y = self._materialize_window_samples(validation_manifest, final_target_cols)
-        test_x, test_y = self._materialize_window_samples(test_manifest, final_target_cols)
+        train_x, train_y, train_ratio = self._materialize_window_samples(train_manifest, final_target_cols)
+        val_x, val_y, val_ratio = self._materialize_window_samples(validation_manifest, final_target_cols)
+        test_x, test_y, test_ratio = self._materialize_window_samples(test_manifest, final_target_cols)
 
-        train_x, train_y = self._maybe_subsample_window_samples(
+        train_x, train_y, train_ratio = self._maybe_subsample_window_samples(
             train_x,
             train_y,
             split_name="train",
             apply_subsample=True,
+            ratio_pre_ds=train_ratio,
         )
-        train_x, train_y = self._apply_post_subsample_filters(
+        train_x, train_y, train_ratio = self._apply_post_subsample_filters(
             train_x,
             train_y,
             label_cols=final_target_cols,
             split_name="train",
             apply_filters=True,
+            ratio_pre_ds=train_ratio,
         )
         train_x = self._maybe_downsample_window_array(train_x, "train")
         val_x = self._maybe_downsample_window_array(val_x, "val")
@@ -596,6 +654,11 @@ class DataHandler:
 
         self.config.IN_CHANNELS = len(self.config.data.sensor_cols)
         train_x, val_x, test_x = self._fit_and_apply_scaler(train_x, val_x, test_x)
+        self.last_split_ratio_pre_ds = {
+            "train": train_ratio.astype(np.float32, copy=False),
+            "val": val_ratio.astype(np.float32, copy=False),
+            "test": test_ratio.astype(np.float32, copy=False),
+        }
         return (train_x, train_y), (val_x, val_y), (test_x, test_y), final_target_cols
 
     def _get_data_loaders_from_window_samples(self):
@@ -603,6 +666,10 @@ class DataHandler:
         X = payload["X"]
         y = payload["y"]
         experiment = payload["experiment"]
+        ratio_pre_ds_all = payload.get("label_ratio_pre_ds")
+        if ratio_pre_ds_all is None:
+            ratio_pre_ds_all = y.astype(np.float32, copy=False)
+        ratio_pre_ds_all = np.asarray(ratio_pre_ds_all, dtype=np.float32)
         final_target_cols = list(payload["label_cols"])
 
         test_mask = experiment == self.config.data.test_experiment_id
@@ -611,23 +678,28 @@ class DataHandler:
 
         train_x = X[train_mask]
         train_y = y[train_mask]
+        train_ratio = ratio_pre_ds_all[train_mask]
         val_x = X[validation_mask]
         val_y = y[validation_mask]
+        val_ratio = ratio_pre_ds_all[validation_mask]
         test_x = X[test_mask]
         test_y = y[test_mask]
+        test_ratio = ratio_pre_ds_all[test_mask]
 
-        train_x, train_y = self._maybe_subsample_window_samples(
+        train_x, train_y, train_ratio = self._maybe_subsample_window_samples(
             train_x,
             train_y,
             split_name="train",
             apply_subsample=True,
+            ratio_pre_ds=train_ratio,
         )
-        train_x, train_y = self._apply_post_subsample_filters(
+        train_x, train_y, train_ratio = self._apply_post_subsample_filters(
             train_x,
             train_y,
             label_cols=final_target_cols,
             split_name="train",
             apply_filters=True,
+            ratio_pre_ds=train_ratio,
         )
         train_x = self._maybe_downsample_window_array(train_x, "train")
         val_x = self._maybe_downsample_window_array(val_x, "val")
@@ -635,11 +707,17 @@ class DataHandler:
 
         self.config.IN_CHANNELS = len(self.config.data.sensor_cols)
         train_x, val_x, test_x = self._fit_and_apply_scaler(train_x, val_x, test_x)
+        self.last_split_ratio_pre_ds = {
+            "train": train_ratio.astype(np.float32, copy=False),
+            "val": val_ratio.astype(np.float32, copy=False),
+            "test": test_ratio.astype(np.float32, copy=False),
+        }
         return (train_x, train_y), (val_x, val_y), (test_x, test_y), final_target_cols
 
     def get_data_loaders(self):
         print("Starting data preparation...", flush=True)
         self._source_segment_cache = {}
+        self.last_split_ratio_pre_ds = {}
 
         if self.dataset_kind == "raw":
             return self._get_data_loaders_from_raw()
