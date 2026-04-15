@@ -118,6 +118,10 @@ def print_key_run_params(args, resolved_dataset_file):
     print(f"feature_engine : {on_off(args.feature_engineering)}")
     print(f"feature_domain : {str(getattr(args, 'feature_domain', 'time')).strip().lower()}")
     print(f"spectrum_method: {str(getattr(args, 'spectrum_method', 'rfft')).strip().lower()}")
+    print(f"pos_threshold  : {str(getattr(args, 'pos_threshold', '')).strip() or 'NONE'}")
+    print(f"ovr_neg_balance: {on_off(getattr(args, 'ovr_neg_balance', False))}")
+    print(f"ovr_pos_neg_rt : {float(getattr(args, 'ovr_pos_neg_ratio', 1.0))}")
+    print(f"ovr_neg_target : {str(getattr(args, 'ovr_neg_target_ratio', '')).strip() or 'NONE'}")
     print("==================\n")
 
 
@@ -300,16 +304,29 @@ if __name__ == '__main__':
              "Stats are written into run_summary.json together with training/testing results."
     )
     parser.add_argument(
-        "--driving_pos_threshold",
-        type=float,
-        default=None,
-        help="Positive-scope threshold for Driving labels in training filter, range [0,1]."
+        "--pos_threshold",
+        default="",
+        help="Per-classifier positive ratio threshold. "
+             "Format: 'LabelA:0.3,LabelB:0.2' (ratio uses pre-downsample window label ratio)."
     )
     parser.add_argument(
-        "--lifting_pos_threshold",
+        "--ovr_neg_balance",
+        default=False,
+        help="Enable OvR negative-sample balancing per classifier."
+    )
+    parser.add_argument(
+        "--ovr_pos_neg_ratio",
         type=float,
-        default=None,
-        help="Positive-scope threshold for Lifting labels in training filter, range [0,1]."
+        default=1.0,
+        help="Target pos/neg ratio per OvR classifier when --ovr_neg_balance=True. "
+             "1 means equal, 2 means positives are 2x negatives."
+    )
+    parser.add_argument(
+        "--ovr_neg_target_ratio",
+        default="",
+        help="Optional per-classifier negative-bucket target ratio. "
+             "Format: 'TargetLabel:NegBucketLabel:Percent;Target2:Neg2:Percent'. "
+             "Example: 'Lifting(raising):Driving(curve):15'."
     )
     subparsers = parser.add_subparsers(dest="model", help="Select the model type.")
     parser_XGB = subparsers.add_parser(
@@ -464,8 +481,6 @@ if __name__ == '__main__':
         n_train_data_samples=args.train_sample_num,
         preprocess_order=preprocess_order,
         single_label_only=args.single_label_only,
-        driving_pos_threshold=args.driving_pos_threshold,
-        lifting_pos_threshold=args.lifting_pos_threshold,
     )
     test_on_step1_full = parse_bool_arg(args.test_on_step1_full, default=False)
     external_test_handler = None
@@ -479,8 +494,6 @@ if __name__ == '__main__':
             n_train_data_samples=args.train_sample_num,
             preprocess_order=preprocess_order,
             single_label_only=False,
-            driving_pos_threshold=None,
-            lifting_pos_threshold=None,
         )
         print(
             "External test mode enabled: test split will use full step=1 windows "
@@ -498,6 +511,10 @@ if __name__ == '__main__':
         train, val, test, target_vals = datahandler.get_data_loaders()
         print_fold_data_overview(train, val, test, target_vals)
         split_ratio_pre_ds = datahandler.get_last_split_ratio_pre_ds()
+        train_ratio = _safe_ratio_matrix(split_ratio_pre_ds.get("train"), train[1])
+        val_ratio = _safe_ratio_matrix(split_ratio_pre_ds.get("val"), val[1])
+        train_for_model = (train[0], train[1], train_ratio)
+        val_for_model = (val[0], val[1], val_ratio)
         fold_sample_stats = None
 
         if enable_sample_stats and dataset_level_sample_stats is None:
@@ -506,8 +523,6 @@ if __name__ == '__main__':
             print_dataset_label_ratio_stats(dataset_level_sample_stats)
 
         if enable_sample_stats:
-            train_ratio = _safe_ratio_matrix(split_ratio_pre_ds.get("train"), train[1])
-            val_ratio = _safe_ratio_matrix(split_ratio_pre_ds.get("val"), val[1])
             include_val_in_train = parse_bool_arg(args.train_with_val, default=False)
             if include_val_in_train:
                 y_for_stats = np.concatenate([np.asarray(train[1]), np.asarray(val[1])], axis=0)
@@ -537,8 +552,8 @@ if __name__ == '__main__':
                     target_vals=target_vals,
                     config=config,
                     preprocess_order=preprocess_order,
-                    train_data=train,
-                    val_data=val,
+                    train_data=train_for_model,
+                    val_data=val_for_model,
                     scaler=datahandler.scaler,
                 )
                 for k, v in optuna_result["best_params"].items():
@@ -552,7 +567,7 @@ if __name__ == '__main__':
             if hasattr(model, "set_input_scaler"):
                 model.set_input_scaler(datahandler.scaler)
             print("Training model...")
-            model.train(train, val)
+            model.train(train_for_model, val_for_model)
             print("Evaluating model...")
 
             if external_test_handler is not None:

@@ -15,8 +15,6 @@ class DataHandler:
         n_train_data_samples=100_000,
         preprocess_order="downsample_first",
         single_label_only=False,
-        driving_pos_threshold=None,
-        lifting_pos_threshold=None,
         downsample_window_size=40,
         downsample_window_step=20,
     ):
@@ -33,8 +31,6 @@ class DataHandler:
         self.n_train_data_samples = int(n_train_data_samples)
         self.preprocess_order = str(preprocess_order).lower()
         self.single_label_only = str(single_label_only).strip().lower() in {"1", "true", "yes", "y", "on"}
-        self.driving_pos_threshold = self._parse_threshold(driving_pos_threshold)
-        self.lifting_pos_threshold = self._parse_threshold(lifting_pos_threshold)
 
         self.data_root = Path(r"D:\Code\research_intern\Pal2sim\cpsHAR\data")
         self.local_path = self.data_root / Path(self.config.data.dataset_file).name
@@ -46,19 +42,6 @@ class DataHandler:
         self.last_split_ratio_pre_ds = {}
 
         self._load_data_set()
-
-    @staticmethod
-    def _parse_threshold(value):
-        if value is None:
-            return None
-        text = str(value).strip().lower()
-        if text in {"", "none", "null", "false"}:
-            return None
-        try:
-            parsed = float(text)
-        except ValueError:
-            return None
-        return max(0.0, min(1.0, parsed))
 
     def _get_merged_data(self, meta_subset):
         merged = [row["data"] for _, row in meta_subset.iterrows()]
@@ -316,8 +299,6 @@ class DataHandler:
             return np.empty((0,), dtype=bool)
 
         keep_mask = np.ones(n_samples, dtype=bool)
-        label_to_idx = {name: idx for idx, name in enumerate(label_cols)}
-
         if self.single_label_only:
             active_counts = np.sum(y_arr, axis=1)
             single_mask = active_counts <= 1
@@ -328,32 +309,6 @@ class DataHandler:
                 f"Post-filter [{split_name}] single_label_only: "
                 f"{before} -> {after} samples"
             )
-
-        def apply_group_threshold(group_name, idx_list, threshold):
-            nonlocal keep_mask
-            if threshold is None or not idx_list:
-                return
-
-            group_values = y_arr[:, idx_list].astype(np.float32)
-            group_ratio = np.mean(group_values, axis=1)
-            positive_scope = group_ratio > 0.0
-            cond = (~positive_scope) | (group_ratio >= threshold)
-
-            before = int(np.sum(keep_mask))
-            keep_mask &= cond
-            after = int(np.sum(keep_mask))
-            pos_total = int(np.sum(positive_scope))
-            pos_filtered = int(np.sum(positive_scope & ~cond))
-            print(
-                f"Post-filter [{split_name}] {group_name} threshold>={threshold:.2f} "
-                f"(positive scope): {before} -> {after} samples | "
-                f"positive_total={pos_total}, filtered={pos_filtered}"
-            )
-
-        driving_idx = [idx for name, idx in label_to_idx.items() if name.startswith("Driving(")]
-        lifting_idx = [idx for name, idx in label_to_idx.items() if name.startswith("Lifting(")]
-        apply_group_threshold("Driving", driving_idx, self.driving_pos_threshold)
-        apply_group_threshold("Lifting", lifting_idx, self.lifting_pos_threshold)
 
         return keep_mask
 

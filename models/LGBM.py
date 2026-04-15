@@ -48,6 +48,10 @@ class LightGBMClassifierSK:
         use_tsfresh=False,
         feature_domain="time",
         spectrum_method="rfft",
+        pos_threshold="",
+        ovr_neg_balance=False,
+        ovr_pos_neg_ratio=1.0,
+        ovr_neg_target_ratio="",
     ):
         self.classes = classes
         self.use_val_in_train = use_val_in_train
@@ -93,6 +97,15 @@ class LightGBMClassifierSK:
         if self.feature_domain not in {"time", "freq", "time_freq"}:
             self.feature_domain = "time"
         self.spectrum_method = self._normalize_spectrum_method(spectrum_method)
+        self._label_index_map = {
+            str(name).strip().lower(): idx for idx, name in enumerate(self.classes)
+        }
+        self.pos_threshold_map = self._parse_pos_threshold_map(pos_threshold)
+        self.ovr_neg_balance = str(ovr_neg_balance).strip().lower() in {
+            "1", "true", "yes", "y", "on"
+        }
+        self.ovr_pos_neg_ratio = max(1e-6, float(ovr_pos_neg_ratio))
+        self.ovr_neg_target_ratio_map = self._parse_ovr_neg_target_ratio_map(ovr_neg_target_ratio)
         normalized_boosting_type = str(boosting_type).lower()
         if normalized_boosting_type == "lgbt":
             normalized_boosting_type = "gbdt"
@@ -169,6 +182,50 @@ class LightGBMClassifierSK:
         if compact in {"dwt", "wavelet"}:
             return "dwt"
         return "rfft"
+
+    def _parse_pos_threshold_map(self, value):
+        text = str(value).strip() if value is not None else ""
+        if text.lower() in {"", "none", "false", "0", "off", "null"}:
+            return {}
+
+        out = {}
+        raw_items = [it.strip() for it in text.replace(";", ",").split(",") if it.strip()]
+        for item in raw_items:
+            if ":" not in item:
+                continue
+            label_text, thr_text = item.rsplit(":", 1)
+            label_key = label_text.strip().lower()
+            if label_key not in self._label_index_map:
+                continue
+            try:
+                thr = float(thr_text.strip())
+            except ValueError:
+                continue
+            out[self._label_index_map[label_key]] = float(np.clip(thr, 0.0, 1.0))
+        return out
+
+    def _parse_ovr_neg_target_ratio_map(self, value):
+        text = str(value).strip() if value is not None else ""
+        if text.lower() in {"", "none", "false", "0", "off", "null"}:
+            return {}
+
+        out = {}
+        raw_items = [it.strip() for it in text.split(";") if it.strip()]
+        for item in raw_items:
+            parts = [p.strip() for p in item.split(":")]
+            if len(parts) != 3:
+                continue
+            target_label, neg_label, pct_text = parts
+            target_key = target_label.lower()
+            target_idx = self._label_index_map.get(target_key)
+            if target_idx is None:
+                continue
+            try:
+                pct = float(pct_text)
+            except ValueError:
+                continue
+            out[target_idx] = (neg_label, float(np.clip(pct, 0.0, 100.0)))
+        return out
 
     def set_input_scaler(self, scaler):
         self._input_scaler = scaler
@@ -425,6 +482,226 @@ class LightGBMClassifierSK:
             idx = np.linspace(0, n_total - 1, n_samples, dtype=int)
         return X[idx], y[idx]
 
+    def _build_neg_bucket_indices(self, y_2d, neg_idx, target_label_idx):
+        buckets = {}
+        for idx in neg_idx:
+            active = np.where(y_2d[idx] == 1)[0]
+            if len(active) > 1:
+                bucket = "MULTI_LABEL"
+            elif len(active) == 1:
+                bucket = str(self.classes[int(active[0])])
+            else:
+                bucket = "NONE_LABEL"
+            buckets.setdefault(bucket, []).append(int(idx))
+        return {k: np.asarray(v, dtype=np.int64) for k, v in buckets.items()}
+
+    def _resolve_bucket_name_for_label(self, raw_name):
+        name = str(raw_name).strip().lower()
+        if name in {"multi", "multilabel", "multi_label", "multi-label"}:
+            return "MULTI_LABEL"
+        if name in {"none", "none_label", "nolabel", "no_label"}:
+            return "NONE_LABEL"
+        mapped_idx = self._label_index_map.get(name)
+        if mapped_idx is None:
+            return None
+        return str(self.classes[mapped_idx])
+
+    @staticmethod
+    def _distribute_counts(total_count, keys):
+        if total_count <= 0 or not keys:
+            return {k: 0 for k in keys}
+        base = total_count // len(keys)
+        rem = total_count % len(keys)
+        out = {}
+        for i, key in enumerate(keys):
+            out[key] = int(base + (1 if i < rem else 0))
+        return out
+
+    def _augment_bucket_deficit(self, X_source, n_needed, rng):
+        if n_needed <= 0 or len(X_source) == 0:
+            return np.empty((0, X_source.shape[1], X_source.shape[2]), dtype=np.float32)
+        src_idx = rng.choice(len(X_source), size=n_needed, replace=True)
+        source = np.asarray(X_source[src_idx], dtype=np.float32)
+        augmented = self._augment_windows_only(source, "jitter", rng)
+        return np.asarray(augmented, dtype=np.float32)
+
+    def _select_ovr_train_subset(self, X, y_2d, ratio_2d, label_idx):
+        y_2d = np.asarray(y_2d)
+        ratio_2d = np.asarray(ratio_2d, dtype=np.float32)
+        if ratio_2d.shape != y_2d.shape:
+            ratio_2d = y_2d.astype(np.float32, copy=False)
+
+        pos_idx = np.where(y_2d[:, label_idx] == 1)[0].astype(np.int64)
+        neg_idx = np.where(y_2d[:, label_idx] == 0)[0].astype(np.int64)
+
+        thr = self.pos_threshold_map.get(label_idx)
+        if thr is not None and len(pos_idx) > 0:
+            keep = ratio_2d[pos_idx, label_idx] >= float(thr)
+            pos_idx = pos_idx[keep]
+
+        info = {
+            "label": str(self.classes[label_idx]),
+            "pos_threshold": thr,
+            "pos_count_after_threshold": int(len(pos_idx)),
+            "neg_count_available": int(len(neg_idx)),
+            "ovr_neg_balance": bool(self.ovr_neg_balance),
+        }
+
+        if not self.ovr_neg_balance:
+            real_idx = np.concatenate([pos_idx, neg_idx], axis=0).astype(np.int64, copy=False)
+            y_real = np.concatenate(
+                [
+                    np.ones((len(pos_idx),), dtype=np.int8),
+                    np.zeros((len(neg_idx),), dtype=np.int8),
+                ],
+                axis=0,
+            )
+            info.update(
+                {
+                    "target_neg_count": int(len(neg_idx)),
+                    "selected_neg_real": int(len(neg_idx)),
+                    "selected_neg_augmented": 0,
+                    "bucket_plan": {},
+                }
+            )
+            return real_idx, y_real, np.empty((0, X.shape[1], X.shape[2]), dtype=np.float32), np.empty((0,), dtype=np.int8), info
+
+        target_neg = int(round(len(pos_idx) / float(self.ovr_pos_neg_ratio))) if len(pos_idx) > 0 else 0
+        if len(neg_idx) > 0 and target_neg <= 0:
+            target_neg = 1
+        info["target_neg_count"] = int(target_neg)
+
+        if target_neg <= 0 or len(neg_idx) == 0:
+            real_idx = pos_idx.astype(np.int64, copy=False)
+            y_real = np.ones((len(real_idx),), dtype=np.int8)
+            info.update(
+                {
+                    "selected_neg_real": 0,
+                    "selected_neg_augmented": 0,
+                    "bucket_plan": {},
+                }
+            )
+            return real_idx, y_real, np.empty((0, X.shape[1], X.shape[2]), dtype=np.float32), np.empty((0,), dtype=np.int8), info
+
+        buckets = self._build_neg_bucket_indices(y_2d, neg_idx, target_label_idx=label_idx)
+        bucket_keys = sorted(list(buckets.keys()))
+        target_counts = {k: 0 for k in bucket_keys}
+
+        explicit_rule = self.ovr_neg_target_ratio_map.get(label_idx)
+        if explicit_rule is not None:
+            rule_bucket_raw, pct = explicit_rule
+            rule_bucket = self._resolve_bucket_name_for_label(rule_bucket_raw)
+            if rule_bucket is None:
+                rule_bucket = "MULTI_LABEL"
+            if rule_bucket not in target_counts:
+                target_counts[rule_bucket] = 0
+            explicit_count = int(round(target_neg * (pct / 100.0)))
+            explicit_count = min(target_neg, max(0, explicit_count))
+            target_counts[rule_bucket] = explicit_count
+            remaining = target_neg - explicit_count
+            other_keys = [k for k in target_counts.keys() if k != rule_bucket]
+            for k, v in self._distribute_counts(remaining, other_keys).items():
+                target_counts[k] = target_counts.get(k, 0) + v
+        else:
+            multi_key = "MULTI_LABEL"
+            multi_avail = len(buckets.get(multi_key, np.empty((0,), dtype=np.int64)))
+            use_multi = min(target_neg, multi_avail)
+            if multi_key not in target_counts:
+                target_counts[multi_key] = 0
+            target_counts[multi_key] = use_multi
+            remaining = target_neg - use_multi
+            other_keys = [k for k in target_counts.keys() if k != multi_key]
+            for k, v in self._distribute_counts(remaining, other_keys).items():
+                target_counts[k] = target_counts.get(k, 0) + v
+
+        rng = np.random.RandomState(self.random_state + 1009 + int(label_idx) * 13)
+        real_neg_parts = []
+        aug_neg_parts = []
+        bucket_plan = {}
+        unresolved = 0
+
+        for bucket, tgt in target_counts.items():
+            tgt = int(max(0, tgt))
+            avail_idx = buckets.get(bucket, np.empty((0,), dtype=np.int64))
+            avail_n = int(len(avail_idx))
+            if tgt <= 0:
+                bucket_plan[bucket] = {"target": 0, "real": 0, "aug": 0, "available": avail_n}
+                continue
+
+            real_n = min(avail_n, tgt)
+            if real_n > 0:
+                if real_n < avail_n:
+                    chosen = rng.choice(avail_idx, size=real_n, replace=False).astype(np.int64)
+                else:
+                    chosen = avail_idx.astype(np.int64, copy=False)
+                real_neg_parts.append(chosen)
+            else:
+                chosen = np.empty((0,), dtype=np.int64)
+
+            deficit = tgt - real_n
+            aug_n = 0
+            if deficit > 0:
+                if real_n > 0:
+                    aug_x = self._augment_bucket_deficit(X[chosen], deficit, rng)
+                    if len(aug_x) > 0:
+                        aug_neg_parts.append(aug_x)
+                        aug_n = int(len(aug_x))
+                elif avail_n > 0:
+                    aug_x = self._augment_bucket_deficit(X[avail_idx], deficit, rng)
+                    if len(aug_x) > 0:
+                        aug_neg_parts.append(aug_x)
+                        aug_n = int(len(aug_x))
+                if aug_n < deficit:
+                    unresolved += (deficit - aug_n)
+
+            bucket_plan[bucket] = {
+                "target": int(tgt),
+                "real": int(real_n),
+                "aug": int(aug_n),
+                "available": int(avail_n),
+            }
+
+        if unresolved > 0 and len(neg_idx) > 0:
+            fallback_aug = self._augment_bucket_deficit(X[neg_idx], unresolved, rng)
+            if len(fallback_aug) > 0:
+                aug_neg_parts.append(fallback_aug)
+                bucket_plan["FALLBACK_AUG"] = {
+                    "target": int(unresolved),
+                    "real": 0,
+                    "aug": int(len(fallback_aug)),
+                    "available": int(len(neg_idx)),
+                }
+
+        real_neg_idx = (
+            np.concatenate(real_neg_parts, axis=0).astype(np.int64, copy=False)
+            if real_neg_parts
+            else np.empty((0,), dtype=np.int64)
+        )
+        aug_neg_x = (
+            np.concatenate(aug_neg_parts, axis=0).astype(np.float32, copy=False)
+            if aug_neg_parts
+            else np.empty((0, X.shape[1], X.shape[2]), dtype=np.float32)
+        )
+
+        real_idx = np.concatenate([pos_idx, real_neg_idx], axis=0).astype(np.int64, copy=False)
+        y_real = np.concatenate(
+            [
+                np.ones((len(pos_idx),), dtype=np.int8),
+                np.zeros((len(real_neg_idx),), dtype=np.int8),
+            ],
+            axis=0,
+        )
+        y_aug = np.zeros((len(aug_neg_x),), dtype=np.int8)
+
+        info.update(
+            {
+                "selected_neg_real": int(len(real_neg_idx)),
+                "selected_neg_augmented": int(len(aug_neg_x)),
+                "bucket_plan": bucket_plan,
+            }
+        )
+        return real_idx, y_real, aug_neg_x, y_aug, info
+
     def _resolve_rotation_indices(self, n_channels):
         name_to_idx = {str(name): i for i, name in enumerate(self.sensor_cols)}
         required = ["Acc.x", "Acc.y", "Acc.z", "Gyro.x", "Gyro.y", "Gyro.z"]
@@ -642,28 +919,53 @@ class LightGBMClassifierSK:
         return out_x, out_y
 
     def train(self, train_data, val_data):
-        train_X, train_y = train_data
-        val_X, val_y = val_data
+        if len(train_data) >= 3:
+            train_X, train_y, train_ratio = train_data[:3]
+        else:
+            train_X, train_y = train_data[:2]
+            train_ratio = np.asarray(train_y, dtype=np.float32)
+
+        if len(val_data) >= 3:
+            val_X, val_y, val_ratio = val_data[:3]
+        else:
+            val_X, val_y = val_data[:2]
+            val_ratio = np.asarray(val_y, dtype=np.float32)
 
         if self.use_val_in_train:
             base_X = np.concatenate([train_X, val_X], axis=0)
             base_y = np.concatenate([train_y, val_y], axis=0)
+            base_ratio = np.concatenate([np.asarray(train_ratio), np.asarray(val_ratio)], axis=0)
             sampled_X, sampled_y = self._subsample_train_data(base_X, base_y)
+            sampled_ratio = self._subsample_train_data(base_X, base_ratio)[1]
             sampled_X = self._maybe_downsample_windows(sampled_X)
             y_fit_2d = np.asarray(sampled_y)
+            ratio_fit_2d = np.asarray(sampled_ratio, dtype=np.float32)
             if y_fit_2d.ndim == 1:
                 y_fit_2d = y_fit_2d.reshape(-1, 1)
+            if ratio_fit_2d.ndim == 1:
+                ratio_fit_2d = ratio_fit_2d.reshape(-1, 1)
             split_name = "merged train+val"
-            del base_X, base_y, sampled_y
+            del base_X, base_y, base_ratio, sampled_y, sampled_ratio
         else:
             sampled_X, sampled_y = self._subsample_train_data(train_X, train_y)
+            sampled_ratio = self._subsample_train_data(train_X, np.asarray(train_ratio))[1]
             sampled_X = self._maybe_downsample_windows(sampled_X)
             y_fit_2d = np.asarray(sampled_y)
+            ratio_fit_2d = np.asarray(sampled_ratio, dtype=np.float32)
             if y_fit_2d.ndim == 1:
                 y_fit_2d = y_fit_2d.reshape(-1, 1)
+            if ratio_fit_2d.ndim == 1:
+                ratio_fit_2d = ratio_fit_2d.reshape(-1, 1)
             split_name = "train only"
 
         sampled_X, y_fit_2d = self._augment_train_data(sampled_X, y_fit_2d)
+        if ratio_fit_2d.shape[1] != y_fit_2d.shape[1]:
+            ratio_fit_2d = y_fit_2d.astype(np.float32, copy=False)
+        elif ratio_fit_2d.shape[0] < y_fit_2d.shape[0]:
+            extra = y_fit_2d[ratio_fit_2d.shape[0]:].astype(np.float32, copy=False)
+            ratio_fit_2d = np.concatenate([ratio_fit_2d, extra], axis=0)
+        elif ratio_fit_2d.shape[0] > y_fit_2d.shape[0]:
+            ratio_fit_2d = ratio_fit_2d[: y_fit_2d.shape[0]]
 
         base_feat = None
         if not self.signal_combo_map:
@@ -680,16 +982,60 @@ class LightGBMClassifierSK:
 
         self.models = []
         for label_idx in range(y_fit_2d.shape[1]):
+            train_idx, y_real, aug_neg_x, y_aug, balance_info = self._select_ovr_train_subset(
+                sampled_X,
+                y_fit_2d,
+                ratio_fit_2d,
+                label_idx=label_idx,
+            )
+            print(
+                f"[OvR] {balance_info['label']}: pos={balance_info['pos_count_after_threshold']}, "
+                f"neg_target={balance_info['target_neg_count']}, "
+                f"neg_real={balance_info['selected_neg_real']}, neg_aug={balance_info['selected_neg_augmented']}"
+            )
+            if balance_info.get("bucket_plan"):
+                plan_parts = []
+                for bucket_name, bucket_stat in balance_info["bucket_plan"].items():
+                    plan_parts.append(
+                        f"{bucket_name} tgt={bucket_stat['target']} real={bucket_stat['real']} aug={bucket_stat['aug']}"
+                    )
+                print(f"[OvR-Buckets] {balance_info['label']}: " + " | ".join(plan_parts))
+
             model = self._estimator_cls(**self._model_params)
             if base_feat is not None:
-                fit_feat = base_feat
+                fit_feat_real = base_feat[train_idx]
             else:
-                label_X = self._select_windows_for_label(sampled_X, label_idx)
-                fit_feat = self._extract_features_batched(label_X)
-            model.fit(fit_feat, y_fit_2d[:, label_idx])
+                label_X_real = self._select_windows_for_label(sampled_X[train_idx], label_idx)
+                fit_feat_real = self._extract_features_batched(label_X_real)
+
+            y_train_bin = y_real
+            if len(aug_neg_x) > 0:
+                if base_feat is not None:
+                    fit_feat_aug = self._extract_features_batched(aug_neg_x)
+                else:
+                    label_X_aug = self._select_windows_for_label(aug_neg_x, label_idx)
+                    fit_feat_aug = self._extract_features_batched(label_X_aug)
+                fit_feat = np.concatenate([fit_feat_real, fit_feat_aug], axis=0)
+                y_train_bin = np.concatenate([y_real, y_aug], axis=0)
+            else:
+                fit_feat = fit_feat_real
+
+            if len(np.unique(y_train_bin)) < 2:
+                print(
+                    f"[OvR] {self.classes[label_idx]} has single class after filtering/balancing. "
+                    f"Falling back to unbalanced full pool for this label."
+                )
+                if base_feat is not None:
+                    fit_feat = base_feat
+                else:
+                    label_X_all = self._select_windows_for_label(sampled_X, label_idx)
+                    fit_feat = self._extract_features_batched(label_X_all)
+                y_train_bin = y_fit_2d[:, label_idx]
+
+            model.fit(fit_feat, y_train_bin)
             self.models.append(model)
 
-        del sampled_X, base_feat, y_fit_2d, train_X, train_y, val_X, val_y
+        del sampled_X, base_feat, y_fit_2d, ratio_fit_2d, train_X, train_y, val_X, val_y, train_ratio, val_ratio
         gc.collect()
         print("Training done.")
 

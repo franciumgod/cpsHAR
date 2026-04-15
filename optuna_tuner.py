@@ -57,7 +57,7 @@ def tune_hyperparameters_for_fold(
     timeout = None if timeout is None else int(timeout)
     seed = int(getattr(args, "optuna_seed", 42))
 
-    val_x, val_y = val_data
+    val_x, val_y = val_data[:2]
     if val_x is None or len(val_x) == 0:
         raise ValueError("Validation split is empty; Optuna tuning requires validation data.")
 

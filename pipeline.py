@@ -144,6 +144,10 @@ def build_model(
     use_tsfresh = parse_bool_arg(getattr(args, "use_tsfresh", False), default=False)
     feature_domain = str(getattr(args, "feature_domain", "time")).strip().lower()
     spectrum_method = str(getattr(args, "spectrum_method", "rfft")).strip().lower()
+    pos_threshold = str(getattr(args, "pos_threshold", "")).strip()
+    ovr_neg_balance = parse_bool_arg(getattr(args, "ovr_neg_balance", False), default=False)
+    ovr_pos_neg_ratio = float(getattr(args, "ovr_pos_neg_ratio", 1.0))
+    ovr_neg_target_ratio = str(getattr(args, "ovr_neg_target_ratio", "")).strip()
     signal_combo_map = (
         build_special_signal_combo_map(config.data.sensor_cols) if use_signal_combo else None
     )
@@ -189,6 +193,10 @@ def build_model(
             use_tsfresh=use_tsfresh,
             feature_domain=feature_domain,
             spectrum_method=spectrum_method,
+            pos_threshold=pos_threshold,
+            ovr_neg_balance=ovr_neg_balance,
+            ovr_pos_neg_ratio=ovr_pos_neg_ratio,
+            ovr_neg_target_ratio=ovr_neg_target_ratio,
         )
 
     return XGBoostClassifierSK(
@@ -218,4 +226,8 @@ def build_model(
         use_tsfresh=use_tsfresh,
         feature_domain=feature_domain,
         spectrum_method=spectrum_method,
+        pos_threshold=pos_threshold,
+        ovr_neg_balance=ovr_neg_balance,
+        ovr_pos_neg_ratio=ovr_pos_neg_ratio,
+        ovr_neg_target_ratio=ovr_neg_target_ratio,
     )
