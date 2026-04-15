@@ -39,7 +39,7 @@ class XGBoostClassifierSK:
         rotation_max_degrees=15.0,
         tta_samples=False,
         tta_method="jitter",
-        feature_engineering=False,
+        feature_engineering=True,
     ):
         self.classes = classes
         self.use_val_in_train = use_val_in_train

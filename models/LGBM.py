@@ -142,6 +142,9 @@ class LightGBMClassifierSK:
         methods = [p for p in parts if p in valid]
         return methods if methods else ([default] if default else [])
 
+    def set_input_scaler(self, scaler):
+        self._input_scaler = scaler
+
     def _select_windows_for_label(self, X, label_idx):
         if not self.signal_combo_map:
             return X
@@ -251,27 +254,98 @@ class LightGBMClassifierSK:
             idx = np.linspace(0, n_total - 1, n_samples, dtype=int)
         return X[idx], y[idx]
 
-    def _apply_rotation_3d(self, X, rng):
-        X_rot = np.asarray(X, dtype=np.float32).copy()
-        n, _, c = X_rot.shape
-        if c < 3:
-            return X_rot
+    def _resolve_rotation_indices(self, n_channels):
+        name_to_idx = {str(name): i for i, name in enumerate(self.sensor_cols)}
+        required = ["Acc.x", "Acc.y", "Acc.z", "Gyro.x", "Gyro.y", "Gyro.z"]
+        if all((k in name_to_idx and name_to_idx[k] < n_channels) for k in required):
+            acc_idx = np.array([name_to_idx["Acc.x"], name_to_idx["Acc.y"], name_to_idx["Acc.z"]], dtype=np.int64)
+            gyro_idx = np.array([name_to_idx["Gyro.x"], name_to_idx["Gyro.y"], name_to_idx["Gyro.z"]], dtype=np.int64)
+            acc_norm_idx = name_to_idx["Acc.norm"] if "Acc.norm" in name_to_idx and name_to_idx["Acc.norm"] < n_channels else None
+            gyro_norm_idx = name_to_idx["Gyro.norm"] if "Gyro.norm" in name_to_idx and name_to_idx["Gyro.norm"] < n_channels else None
+            return acc_idx, gyro_idx, acc_norm_idx, gyro_norm_idx
 
-        angles = rng.uniform(-15.0, 15.0, size=(n, 3)).astype(np.float32) * (np.pi / 180.0)
-        for i in range(n):
-            ax, ay, az = angles[i]
-            cx, sx = np.cos(ax), np.sin(ax)
-            cy, sy = np.cos(ay), np.sin(ay)
-            cz, sz = np.cos(az), np.sin(az)
-            rx = np.array([[1, 0, 0], [0, cx, -sx], [0, sx, cx]], dtype=np.float32)
-            ry = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]], dtype=np.float32)
-            rz = np.array([[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]], dtype=np.float32)
-            r = rz @ ry @ rx
+        if n_channels >= 6:
+            acc_norm_idx = 7 if n_channels > 7 else None
+            gyro_norm_idx = 8 if n_channels > 8 else None
+            return np.array([0, 1, 2], dtype=np.int64), np.array([3, 4, 5], dtype=np.int64), acc_norm_idx, gyro_norm_idx
 
-            X_rot[i, :, :3] = X_rot[i, :, :3] @ r.T
-            if c >= 6:
-                X_rot[i, :, 3:6] = X_rot[i, :, 3:6] @ r.T
-        return X_rot
+        return None, None, None, None
+
+    def _build_rotation_matrices(self, n_samples, max_rotation_degrees, rotation_plane):
+        rotation_limit = np.deg2rad(float(max_rotation_degrees))
+        plane = str(rotation_plane).strip().lower()
+        if plane not in {"xyz", "xy", "xz", "yz"}:
+            plane = "xyz"
+
+        if plane == "xyz":
+            angles = self.rng.uniform(-rotation_limit, rotation_limit, size=(n_samples, 3)).astype(np.float32)
+        elif plane == "xy":
+            angles = np.zeros((n_samples, 3), dtype=np.float32)
+            angles[:, 2] = self.rng.uniform(-rotation_limit, rotation_limit, size=n_samples).astype(np.float32)
+        elif plane == "xz":
+            angles = np.zeros((n_samples, 3), dtype=np.float32)
+            angles[:, 1] = self.rng.uniform(-rotation_limit, rotation_limit, size=n_samples).astype(np.float32)
+        else:
+            angles = np.zeros((n_samples, 3), dtype=np.float32)
+            angles[:, 0] = self.rng.uniform(-rotation_limit, rotation_limit, size=n_samples).astype(np.float32)
+
+        ax, ay, az = angles[:, 0], angles[:, 1], angles[:, 2]
+        cos_x, sin_x = np.cos(ax), np.sin(ax)
+        cos_y, sin_y = np.cos(ay), np.sin(ay)
+        cos_z, sin_z = np.cos(az), np.sin(az)
+
+        matrices = np.empty((n_samples, 3, 3), dtype=np.float32)
+        matrices[:, 0, 0] = cos_y * cos_z
+        matrices[:, 0, 1] = cos_z * sin_x * sin_y - cos_x * sin_z
+        matrices[:, 0, 2] = sin_x * sin_z + cos_x * cos_z * sin_y
+        matrices[:, 1, 0] = cos_y * sin_z
+        matrices[:, 1, 1] = cos_x * cos_z + sin_x * sin_y * sin_z
+        matrices[:, 1, 2] = cos_x * sin_y * sin_z - cos_z * sin_x
+        matrices[:, 2, 0] = -sin_y
+        matrices[:, 2, 1] = cos_y * sin_x
+        matrices[:, 2, 2] = cos_x * cos_y
+        return matrices
+
+    def _apply_rotation_3d(self, X):
+        X_in = np.asarray(X, dtype=np.float32)
+        if X_in.ndim != 3 or len(X_in) == 0:
+            return X_in
+
+        n, t, c = X_in.shape
+        acc_idx, gyro_idx, acc_norm_idx, gyro_norm_idx = self._resolve_rotation_indices(c)
+        if acc_idx is None or gyro_idx is None:
+            return X_in
+
+        use_scaler = self._input_scaler is not None and hasattr(self._input_scaler, "inverse_transform") and hasattr(self._input_scaler, "transform")
+        if use_scaler:
+            flat = X_in.reshape(-1, c)
+            unscaled = self._input_scaler.inverse_transform(flat).reshape(n, t, c).astype(np.float32, copy=False)
+        else:
+            unscaled = X_in.copy()
+
+        rot_matrices = self._build_rotation_matrices(
+            n_samples=n,
+            max_rotation_degrees=self.rotation_max_degrees,
+            rotation_plane=self.rotation_plane,
+        )
+
+        acc_data = unscaled[:, :, acc_idx]
+        gyro_data = unscaled[:, :, gyro_idx]
+        rotated_acc = np.einsum("nij,ntj->nti", rot_matrices, acc_data)
+        rotated_gyro = np.einsum("nij,ntj->nti", rot_matrices, gyro_data)
+
+        unscaled[:, :, acc_idx] = rotated_acc
+        unscaled[:, :, gyro_idx] = rotated_gyro
+        if acc_norm_idx is not None:
+            unscaled[:, :, acc_norm_idx] = np.linalg.norm(rotated_acc, axis=2)
+        if gyro_norm_idx is not None:
+            unscaled[:, :, gyro_norm_idx] = np.linalg.norm(rotated_gyro, axis=2)
+
+        if use_scaler:
+            flat = unscaled.reshape(-1, c)
+            scaled = self._input_scaler.transform(flat).reshape(n, t, c)
+            return np.ascontiguousarray(scaled, dtype=np.float32)
+        return np.ascontiguousarray(unscaled, dtype=np.float32)
 
     def _augment_windows_only(self, base_x, method, rng):
         X = np.asarray(base_x, dtype=np.float32)
@@ -286,7 +360,7 @@ class LightGBMClassifierSK:
             return X * scale
 
         if method == "rotation":
-            return self._apply_rotation_3d(X, rng)
+            return self._apply_rotation_3d(X)
 
         if method == "basic":
             out = self._augment_windows_only(X, "jitter", rng)

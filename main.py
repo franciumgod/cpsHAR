@@ -12,6 +12,7 @@ from utils.utils import (
 )
 from utils.config import Config
 from data_handler import DataHandler
+from optuna_tuner import tune_hyperparameters_for_fold
 from pipeline import (
     resolve_dataset_file,
     parse_bool_arg,
@@ -187,6 +188,19 @@ if __name__ == '__main__':
         help="Time-axis cut ratio used by cutmix, in [0,1]."
     )
     parser.add_argument(
+        "--rotation_plane",
+        type=str,
+        default="xyz",
+        choices=["xyz", "xy", "xz", "yz"],
+        help="Rotation augmentation plane. xyz=3D random, xy/xz/yz=single-plane rotation."
+    )
+    parser.add_argument(
+        "--rotation_max_degrees",
+        type=float,
+        default=15.0,
+        help="Maximum absolute rotation angle in degrees."
+    )
+    parser.add_argument(
         "--tta",
         default="false",
         help="Test-Time Augmentation count. False/0 disables; True enables 1 view; integer N enables N views."
@@ -201,6 +215,24 @@ if __name__ == '__main__':
         "--test_on_step1_full",
         default=False,
         help="Use full step=1 sliding windows for test split while keeping train/val from --data."
+    )
+    parser.add_argument(
+        "--optuna_trials",
+        type=int,
+        default=0,
+        help="Number of Optuna trials per fold. 0 disables tuning (default)."
+    )
+    parser.add_argument(
+        "--optuna_timeout",
+        type=int,
+        default=None,
+        help="Optional Optuna timeout (seconds) per fold."
+    )
+    parser.add_argument(
+        "--optuna_seed",
+        type=int,
+        default=42,
+        help="Random seed for Optuna TPE sampler."
     )
     parser.add_argument(
         "--single_label_only",
@@ -404,7 +436,32 @@ if __name__ == '__main__':
 
         try:
 
-            model = build_model(args, target_vals, config, preprocess_order)
+            fold_args = copy.deepcopy(args)
+            optuna_result = None
+            if int(getattr(args, "optuna_trials", 0)) > 0:
+                print(
+                    f"Running Optuna tuning for fold={fold} | model={fold_args.model} | "
+                    f"trials={fold_args.optuna_trials}..."
+                )
+                optuna_result = tune_hyperparameters_for_fold(
+                    args=fold_args,
+                    target_vals=target_vals,
+                    config=config,
+                    preprocess_order=preprocess_order,
+                    train_data=train,
+                    val_data=val,
+                    scaler=datahandler.scaler,
+                )
+                for k, v in optuna_result["best_params"].items():
+                    setattr(fold_args, k, v)
+                print(
+                    f"Optuna best (fold={fold}): value={optuna_result['best_value']:.4f}, "
+                    f"params={optuna_result['best_params']}"
+                )
+
+            model = build_model(fold_args, target_vals, config, preprocess_order)
+            if hasattr(model, "set_input_scaler"):
+                model.set_input_scaler(datahandler.scaler)
             print("Training model...")
             model.train(train, val)
             print("Evaluating model...")
@@ -475,6 +532,15 @@ if __name__ == '__main__':
                     "test_samples": int(eval_y_true.shape[0]) if eval_y_true is not None else 0,
                     "metrics": fold_metrics,
                     "plots": plot_paths,
+                    "selected_hparams": {
+                        "max_depth": getattr(fold_args, "max_depth", None),
+                        "colsample_bytree": getattr(fold_args, "colsample_bytree", None),
+                        "num_leaves": getattr(fold_args, "num_leaves", None),
+                        "subsample": getattr(fold_args, "subsample", None),
+                        "min_child_samples": getattr(fold_args, "min_child_samples", None),
+                        "min_data_in_leaf": getattr(fold_args, "min_data_in_leaf", None),
+                    },
+                    "optuna": optuna_result,
                 }
             )
 
