@@ -10,3 +10,6 @@ ds_result/
 Reference_code/
 aug/
 out/
+*.cmd
+run*
+encoderblock/

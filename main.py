@@ -224,8 +224,9 @@ if __name__ == '__main__':
     parser.add_argument(
         "--augment_target",
         default="multilabel",
-        help="Augmentation target class selector. Default 'multilabel' (samples with >1 active labels). "
-             "You can also pass a class name to target that class."
+        help="Augmentation target selector. Default 'multilabel' (samples with >1 active labels). "
+             "Supports comma-separated multiple targets (union), e.g. "
+             "'Lifting(lowering),Driving(Straight)' or 'multilabel,Driving(curve)'."
     )
     parser.add_argument(
         "--augment_method",

@@ -170,6 +170,29 @@ class LightGBMClassifierSK:
         return methods if methods else ([default] if default else [])
 
     @staticmethod
+    def _parse_target_list(value):
+        text = str(value).strip() if value is not None else ""
+        if text == "":
+            return []
+        normalized = (
+            text.replace(";", ",")
+            .replace("|", ",")
+            .replace("，", ",")
+        )
+        out = []
+        seen = set()
+        for raw in normalized.split(","):
+            tok = raw.strip().strip("\"'")
+            if not tok:
+                continue
+            key = tok.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(tok)
+        return out
+
+    @staticmethod
     def _normalize_spectrum_method(value):
         text = str(value).strip().lower()
         compact = text.replace(" ", "").replace("-", "").replace("_", "")
@@ -546,8 +569,11 @@ class LightGBMClassifierSK:
             "neg_count_available": int(len(neg_idx)),
             "ovr_neg_balance": bool(self.ovr_neg_balance),
         }
+        explicit_rule = self.ovr_neg_target_ratio_map.get(label_idx)
+        neg_mix_only = (explicit_rule is not None) and (not self.ovr_neg_balance)
+        info["neg_mix_only"] = bool(neg_mix_only)
 
-        if not self.ovr_neg_balance:
+        if not self.ovr_neg_balance and not neg_mix_only:
             real_idx = np.concatenate([pos_idx, neg_idx], axis=0).astype(np.int64, copy=False)
             y_real = np.concatenate(
                 [
@@ -566,9 +592,12 @@ class LightGBMClassifierSK:
             )
             return real_idx, y_real, np.empty((0, X.shape[1], X.shape[2]), dtype=np.float32), np.empty((0,), dtype=np.int8), info
 
-        target_neg = int(round(len(pos_idx) / float(self.ovr_pos_neg_ratio))) if len(pos_idx) > 0 else 0
-        if len(neg_idx) > 0 and target_neg <= 0:
-            target_neg = 1
+        if self.ovr_neg_balance:
+            target_neg = int(round(len(pos_idx) / float(self.ovr_pos_neg_ratio))) if len(pos_idx) > 0 else 0
+            if len(neg_idx) > 0 and target_neg <= 0:
+                target_neg = 1
+        else:
+            target_neg = int(len(neg_idx))
         info["target_neg_count"] = int(target_neg)
 
         if target_neg <= 0 or len(neg_idx) == 0:
@@ -587,7 +616,6 @@ class LightGBMClassifierSK:
         bucket_keys = sorted(list(buckets.keys()))
         target_counts = {k: 0 for k in bucket_keys}
 
-        explicit_rule = self.ovr_neg_target_ratio_map.get(label_idx)
         if explicit_rule is not None:
             rule_bucket_raw, pct = explicit_rule
             rule_bucket = self._resolve_bucket_name_for_label(rule_bucket_raw)
@@ -859,19 +887,36 @@ class LightGBMClassifierSK:
         return out_x.astype(np.float32), y
 
     def _select_augment_mask(self, y_2d):
-        target = self.augment_target.strip().lower()
-        if target in {"multilabel", "multi_label", "multi-label", "multi"}:
-            return np.sum(y_2d, axis=1) > 1
-
-        class_map = {str(name).strip().lower(): idx for idx, name in enumerate(self.classes)}
-        class_idx = class_map.get(target)
-        if class_idx is None:
+        targets = self._parse_target_list(self.augment_target)
+        if not targets:
             print(
                 f"[Augment] Unknown augment_target='{self.augment_target}', "
                 "skip augmentation."
             )
             return np.zeros((len(y_2d),), dtype=bool)
-        return y_2d[:, class_idx] == 1
+
+        multilabel_alias = {"multilabel", "multi_label", "multi-label", "multi"}
+        class_map = {str(name).strip().lower(): idx for idx, name in enumerate(self.classes)}
+        mask = np.zeros((len(y_2d),), dtype=bool)
+        unknown_targets = []
+
+        for target in targets:
+            target_key = target.lower()
+            if target_key in multilabel_alias:
+                mask = np.logical_or(mask, np.sum(y_2d, axis=1) > 1)
+                continue
+            class_idx = class_map.get(target_key)
+            if class_idx is None:
+                unknown_targets.append(target)
+                continue
+            mask = np.logical_or(mask, y_2d[:, class_idx] == 1)
+
+        if unknown_targets:
+            print(
+                f"[Augment] Unknown augment_target(s) ignored: {unknown_targets}. "
+                f"raw='{self.augment_target}'."
+            )
+        return mask
 
     def _augment_train_data(self, X, y_2d):
         if self.augment_count <= 0:
