@@ -28,6 +28,9 @@ from pipeline import (
     build_model,
 )
 import warnings
+import sys
+import numpy.core.numeric
+sys.modules['numpy._core.numeric'] = numpy.core.numeric
 
 # import sys
 # import numpy.core.numeric
@@ -187,12 +190,12 @@ if __name__ == '__main__':
     )
     parser.add_argument(
         "--signal_combo",
-        default=False,
+        default=True,
         help="Whether to use the specific signal combinations for training (default: False)."
     )
     parser.add_argument(
         "--feature_engineering",
-        default=False,
+        default=True,
         help="Enable additional engineered features: RMS, RMSE, first-order diff, and lags (1,3,5,10)."
     )
     parser.add_argument(
@@ -210,7 +213,7 @@ if __name__ == '__main__':
     parser.add_argument(
         "--spectrum_method",
         type=str,
-        default="rfft",
+        default="welch_psd",
         help="Frequency-spectrum generator when feature_domain includes freq. "
              "Supported: rfft, welch_psd, stft, dwt."
     )

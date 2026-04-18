@@ -2,7 +2,8 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from numpy.lib._stride_tricks_impl import sliding_window_view
+# from numpy.lib._stride_tricks_impl import sliding_window_view
+from numpy.lib.stride_tricks import sliding_window_view
 from sklearn.preprocessing import MinMaxScaler
 
 

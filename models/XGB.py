@@ -1,7 +1,8 @@
 import numpy as np
 from xgboost import XGBClassifier
 import gc
-from numpy.lib._stride_tricks_impl import sliding_window_view
+# from numpy.lib._stride_tricks_impl import sliding_window_view
+from numpy.lib.stride_tricks import sliding_window_view
 
 
 class XGBoostClassifierSK:

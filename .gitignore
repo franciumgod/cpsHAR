@@ -12,4 +12,11 @@ aug/
 out/
 *.cmd
 run*
-encoderblock/
+!run.py
+encoderblock/data/
+encoderblock/result/
+encoderblock/__pycache__/
+encoderblock/utils/__pycache__/
+encoderblock/models/__pycache__/
+encoderblock/output/
+encoderblock/outputs/

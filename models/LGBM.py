@@ -1,7 +1,8 @@
 import gc
 import numpy as np
 from lightgbm import LGBMClassifier
-from numpy.lib._stride_tricks_impl import sliding_window_view
+# from numpy.lib._stride_tricks_impl import sliding_window_view
+from numpy.lib.stride_tricks import sliding_window_view
 
 
 class LightGBMClassifierSK:
