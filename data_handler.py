@@ -18,6 +18,9 @@ class DataHandler:
         single_label_only=False,
         downsample_window_size=40,
         downsample_window_step=20,
+        special_sampling_mode=False,
+        special_sampling_rules=None,
+        adapt_variable_windows=True,
     ):
         self.config = config
         self.include_synthetic_axes = bool(getattr(self.config.data, "use_synthetic_axes", True))
@@ -34,6 +37,13 @@ class DataHandler:
         self.n_train_data_samples = int(n_train_data_samples)
         self.preprocess_order = str(preprocess_order).lower()
         self.single_label_only = str(single_label_only).strip().lower() in {"1", "true", "yes", "y", "on"}
+        self.special_sampling_mode = (
+            str(special_sampling_mode).strip().lower() in {"1", "true", "yes", "y", "on"}
+        )
+        self.special_sampling_rules = self._normalize_special_sampling_rules(special_sampling_rules)
+        self.adapt_variable_windows = (
+            str(adapt_variable_windows).strip().lower() in {"1", "true", "yes", "y", "on"}
+        )
 
         self.data_root = Path(r"D:\Code\research_intern\Pal2sim\cpsHAR\data")
         self.local_path = self.data_root / Path(self.config.data.dataset_file).name
@@ -43,6 +53,7 @@ class DataHandler:
         self.raw_source_data = None
         self._source_segment_cache = {}
         self.last_split_ratio_pre_ds = {}
+        self.last_split_valid_steps = {}
 
         self._load_data_set()
 
@@ -52,6 +63,9 @@ class DataHandler:
 
     def get_last_split_ratio_pre_ds(self):
         return dict(self.last_split_ratio_pre_ds)
+
+    def get_last_split_valid_steps(self):
+        return dict(self.last_split_valid_steps)
 
     def _clean(self, df):
         cols_to_drop = ["Error", "Synchronization", "None", "transportation", "container"]
@@ -186,6 +200,61 @@ class DataHandler:
         unique_superclasses = set(self.config.data.superclass_mapping.values())
         return sorted(list(unique_superclasses))
 
+    @staticmethod
+    def _normalize_special_sampling_rules(rules):
+        default_rules = {
+            "Lifting(raising)": (2000, 200),
+            "Lifting(lowering)": (2000, 200),
+        }
+        if rules is None:
+            return dict(default_rules)
+
+        out = {}
+        for key, value in rules.items():
+            if isinstance(value, dict):
+                window_points = int(value.get("window_points", default_rules.get(key, (2000, 200))[0]))
+                step_points = int(value.get("step_points", default_rules.get(key, (2000, 200))[1]))
+            else:
+                window_points, step_points = value
+                window_points = int(window_points)
+                step_points = int(step_points)
+            if window_points <= 0 or step_points <= 0:
+                continue
+            out[str(key)] = (window_points, step_points)
+
+        for key, value in default_rules.items():
+            out.setdefault(key, value)
+        return out
+
+    @staticmethod
+    def _label_matrix_to_state_names(label_matrix, label_cols):
+        state_names = []
+        for row in label_matrix:
+            active = [label_cols[i] for i, v in enumerate(row) if int(v) == 1]
+            state_names.append("+".join(active) if active else "NONE")
+        return np.asarray(state_names, dtype=object)
+
+    @staticmethod
+    def _find_state_segments(state_names):
+        if len(state_names) == 0:
+            return []
+        change_idx = np.flatnonzero(state_names[1:] != state_names[:-1]) + 1
+        starts = np.concatenate(([0], change_idx))
+        ends = np.concatenate((change_idx, [len(state_names)]))
+        return [(str(state_names[s]), int(s), int(e)) for s, e in zip(starts, ends)]
+
+    def _resolve_special_sampling_rule(self, state_name, default_window_points, default_step_points):
+        special_rules = self.special_sampling_rules
+        active = set(state_name.split("+")) if state_name and state_name != "NONE" else set()
+        priority = [
+            "Lifting(raising)",
+            "Lifting(lowering)",
+        ]
+        for label_name in priority:
+            if label_name in active and label_name in special_rules:
+                return special_rules[label_name]
+        return int(default_window_points), int(default_step_points)
+
     def _downsample_interval(self, df, sensor_cols, label_cols):
         factor = max(1, int(self.config.prep.ds_factor))
         keep_cols = [c for c in (sensor_cols + label_cols) if c in df.columns]
@@ -292,20 +361,22 @@ class DataHandler:
         split_name,
         apply_subsample,
         ratio_pre_ds=None,
+        real_points=None,
     ):
         if not apply_subsample:
-            return X, y, ratio_pre_ds
+            return X, y, ratio_pre_ds, real_points
 
         idx = self._select_subsample_indices(len(X), apply_subsample=True)
         if len(idx) == len(X):
             print(f"Subsample [{split_name}] windows: total={len(X)} -> kept={len(X)}")
-            return X, y, ratio_pre_ds
+            return X, y, ratio_pre_ds, real_points
 
         X_sub = X[idx]
         y_sub = y[idx]
         ratio_sub = ratio_pre_ds[idx] if ratio_pre_ds is not None else None
+        real_points_sub = real_points[idx] if real_points is not None else None
         print(f"Subsample [{split_name}] windows: total={len(X)} -> kept={len(X_sub)}")
-        return X_sub, y_sub, ratio_sub
+        return X_sub, y_sub, ratio_sub, real_points_sub
 
     def _build_train_filter_mask(self, y, label_cols, split_name):
         y_arr = np.asarray(y)
@@ -338,18 +409,20 @@ class DataHandler:
         split_name,
         apply_filters=True,
         ratio_pre_ds=None,
+        real_points=None,
     ):
         before = len(X)
         if not apply_filters:
-            return X, y, ratio_pre_ds
+            return X, y, ratio_pre_ds, real_points
 
         keep_mask = self._build_train_filter_mask(y, label_cols=label_cols, split_name=split_name)
         X = X[keep_mask]
         y = y[keep_mask]
         ratio = ratio_pre_ds[keep_mask] if ratio_pre_ds is not None else None
+        real_points_kept = real_points[keep_mask] if real_points is not None else None
         after = len(X)
         print(f"Post-subsample filter [{split_name}]: {before} -> {after} samples")
-        return X, y, ratio
+        return X, y, ratio, real_points_kept
 
     def _apply_post_subsample_start_filters(
         self,
@@ -381,6 +454,61 @@ class DataHandler:
                 return seq_len
             return 1 + (seq_len - self.downsample_window_size) // self.downsample_window_step
         return seq_len
+
+    def _valid_len_after_downsample_for_real_points(self, real_points):
+        rp = int(max(0, real_points))
+        method = self.downsample_method
+        if method in {"false", "none", "0"}:
+            return rp
+        if method == "interval":
+            factor = max(1, int(self.config.prep.ds_factor))
+            return 1 + (rp - 1) // factor if rp > 0 else 0
+        if method == "sliding_window":
+            if rp < self.downsample_window_size:
+                return rp
+            return 1 + (rp - self.downsample_window_size) // self.downsample_window_step
+        return rp
+
+    def _compute_valid_steps_from_real_points(self, real_points, max_len):
+        max_len = int(max(0, max_len))
+        out = np.zeros((len(real_points),), dtype=np.int32)
+        for i, rp in enumerate(np.asarray(real_points).reshape(-1)):
+            valid = self._valid_len_after_downsample_for_real_points(int(rp))
+            valid = max(1, valid) if max_len > 0 else 0
+            out[i] = int(min(max_len, valid))
+        return out
+
+    @staticmethod
+    def _resample_windows_by_valid_steps(X, valid_steps, target_len):
+        X = np.asarray(X, dtype=np.float32)
+        if X.ndim != 3:
+            return X
+        n_samples, cur_len, n_channels = X.shape
+        target_len = int(target_len)
+        if target_len <= 0 or n_samples == 0:
+            return X
+
+        valid = np.asarray(valid_steps, dtype=np.int32).reshape(-1)
+        if len(valid) != n_samples:
+            valid = np.full((n_samples,), cur_len, dtype=np.int32)
+
+        out = np.empty((n_samples, target_len, n_channels), dtype=np.float32)
+        tgt_pos = np.linspace(0.0, 1.0, num=target_len, dtype=np.float32)
+
+        for i in range(n_samples):
+            steps = int(np.clip(valid[i], 1, cur_len))
+            src = X[i, :steps, :]
+            if steps == target_len:
+                out[i] = src
+                continue
+            if steps == 1:
+                out[i] = np.repeat(src, target_len, axis=0)
+                continue
+
+            src_pos = np.linspace(0.0, 1.0, num=steps, dtype=np.float32)
+            for ch in range(n_channels):
+                out[i, :, ch] = np.interp(tgt_pos, src_pos, src[:, ch]).astype(np.float32, copy=False)
+        return out
 
     def _extract_subsampled_windows_batched(
         self,
@@ -471,11 +599,106 @@ class DataHandler:
 
     def _get_processed_source_df(self, source_index, final_target_cols):
         if source_index not in self._source_segment_cache:
-            source_df = self.raw_source_data.loc[source_index, "data"]
+            source_payload = self.raw_source_data if self.raw_source_data is not None else self.data
+            source_df = source_payload.loc[source_index, "data"]
             processed_df = self._prepare_raw_df(source_df)
             keep_cols = self.config.data.sensor_cols + final_target_cols
             self._source_segment_cache[source_index] = processed_df[keep_cols].reset_index(drop=True)
         return self._source_segment_cache[source_index]
+
+    def _build_special_sample_manifest_from_metadata(
+        self,
+        metadata_subset,
+        final_target_cols,
+        default_window_points=None,
+        default_step_points=500,
+        include_tail_window=True,
+        allow_short_segment_padding=True,
+    ):
+        default_window_points = (
+            int(default_window_points)
+            if default_window_points is not None
+            else int(self.config.prep.original_freq * self.config.prep.seq_len_multiplier)
+        )
+        rows = []
+        ratio_cols = [f"{name}__ratio_pre_ds" for name in final_target_cols]
+
+        for source_index, row in metadata_subset.iterrows():
+            processed_df = self._get_processed_source_df(int(source_index), final_target_cols)
+            if processed_df.empty:
+                continue
+
+            label_values = processed_df[final_target_cols].to_numpy(dtype=np.int8, copy=False)
+            state_names = self._label_matrix_to_state_names(label_values, final_target_cols)
+            state_segments = self._find_state_segments(state_names)
+
+            for state_name, seg_start, seg_end in state_segments:
+                seg_len = int(seg_end - seg_start)
+                if seg_len <= 0:
+                    continue
+
+                window_points, step_points = self._resolve_special_sampling_rule(
+                    state_name=state_name,
+                    default_window_points=default_window_points,
+                    default_step_points=default_step_points,
+                )
+
+                if seg_len < window_points:
+                    if not allow_short_segment_padding:
+                        continue
+                    starts = [int(seg_start)]
+                    real_ends = [int(seg_end)]
+                else:
+                    starts = list(range(seg_start, seg_end - window_points + 1, step_points))
+                    if include_tail_window:
+                        tail_start = int(seg_end - window_points)
+                        if not starts or starts[-1] != tail_start:
+                            starts.append(tail_start)
+                    starts = sorted(set(int(v) for v in starts))
+                    real_ends = [int(start_idx + window_points) for start_idx in starts]
+
+                for start_idx, real_end in zip(starts, real_ends):
+                    label_slice = processed_df.iloc[int(start_idx):int(real_end)][final_target_cols].to_numpy(
+                        dtype=np.float32,
+                        copy=False,
+                    )
+                    if len(label_slice) == 0:
+                        y_end = np.zeros((len(final_target_cols),), dtype=np.int8)
+                        ratio_values = np.zeros((len(final_target_cols),), dtype=np.float32)
+                    else:
+                        y_end = label_slice[-1].astype(np.int8, copy=False)
+                        ratio_values = np.mean(label_slice, axis=0, dtype=np.float32)
+
+                    row_dict = {
+                        "scenario": row["scenario"],
+                        "experiment": int(row["experiment"]),
+                        "source_index": int(source_index),
+                        "start_idx": int(start_idx),
+                        "end_idx": int(real_end),
+                        "state_name": str(state_name),
+                        "real_points": int(real_end - start_idx),
+                        "window_points": int(window_points),
+                        "step_points": int(step_points),
+                    }
+                    for label_idx, label_name in enumerate(final_target_cols):
+                        row_dict[label_name] = int(y_end[label_idx])
+                        row_dict[ratio_cols[label_idx]] = float(ratio_values[label_idx])
+                    rows.append(row_dict)
+
+        if not rows:
+            cols = [
+                "scenario",
+                "experiment",
+                "source_index",
+                "start_idx",
+                "end_idx",
+                "state_name",
+                "real_points",
+                "window_points",
+                "step_points",
+            ] + list(final_target_cols) + ratio_cols
+            return pd.DataFrame(columns=cols)
+        return pd.DataFrame(rows)
 
     def _materialize_window_samples(self, sample_df, final_target_cols):
         sample_df = sample_df.reset_index(drop=True)
@@ -483,9 +706,13 @@ class DataHandler:
             empty_x = np.empty((0, 0, len(self.config.data.sensor_cols)), dtype=np.float32)
             empty_y = np.empty((0, len(final_target_cols)), dtype=np.int8)
             empty_ratio = np.empty((0, len(final_target_cols)), dtype=np.float32)
-            return empty_x, empty_y, empty_ratio
+            empty_real_points = np.empty((0,), dtype=np.int32)
+            return empty_x, empty_y, empty_ratio, empty_real_points
 
-        window_size = int(sample_df.iloc[0]["end_idx"] - sample_df.iloc[0]["start_idx"])
+        if "window_points" in sample_df.columns:
+            window_size = int(sample_df["window_points"].max())
+        else:
+            window_size = int((sample_df["end_idx"] - sample_df["start_idx"]).max())
         X = np.empty((len(sample_df), window_size, len(self.config.data.sensor_cols)), dtype=np.float32)
         ratio_pre_ds = np.empty((len(sample_df), len(final_target_cols)), dtype=np.float32)
         ratio_cols = [f"{name}__ratio_pre_ds" for name in final_target_cols]
@@ -498,6 +725,12 @@ class DataHandler:
             sample_values = processed_df.iloc[int(row.start_idx):int(row.end_idx)][
                 self.config.data.sensor_cols
             ].to_numpy(dtype=np.float32, copy=False)
+            if len(sample_values) < window_size:
+                pad_rows = int(window_size - len(sample_values))
+                if len(sample_values) == 0:
+                    sample_values = np.zeros((window_size, len(self.config.data.sensor_cols)), dtype=np.float32)
+                else:
+                    sample_values = np.pad(sample_values, ((0, pad_rows), (0, 0)), mode="edge")
             X[row_idx] = sample_values
             if not has_ratio_cols:
                 label_slice = processed_df.iloc[int(row.start_idx):int(row.end_idx)][
@@ -506,7 +739,12 @@ class DataHandler:
                 ratio_pre_ds[row_idx] = np.mean(label_slice, axis=0, dtype=np.float32)
 
         y = sample_df[final_target_cols].to_numpy(dtype=np.int8, copy=False)
-        return X, y, ratio_pre_ds
+        if "real_points" in sample_df.columns:
+            real_points = sample_df["real_points"].to_numpy(dtype=np.int32, copy=False)
+        else:
+            real_points = (sample_df["end_idx"] - sample_df["start_idx"]).to_numpy(dtype=np.int32, copy=False)
+        real_points = np.clip(real_points, 0, window_size).astype(np.int32, copy=False)
+        return X, y, ratio_pre_ds, real_points
 
     def _get_data_loaders_from_raw(self):
         test_mask = self.data["experiment"] == self.config.data.test_experiment_id
@@ -526,6 +764,94 @@ class DataHandler:
 
         final_target_cols = self._get_final_target_cols()
         self.config.IN_CHANNELS = len(self.config.data.sensor_cols)
+
+        if self.special_sampling_mode:
+            raw_window_points = int(self.config.prep.original_freq * self.config.prep.seq_len_multiplier)
+            train_manifest = self._build_special_sample_manifest_from_metadata(
+                train_metadata,
+                final_target_cols,
+                default_window_points=raw_window_points,
+                default_step_points=500,
+            )
+            validation_manifest = self._build_special_sample_manifest_from_metadata(
+                validation_metadata,
+                final_target_cols,
+                default_window_points=raw_window_points,
+                default_step_points=500,
+            )
+            test_manifest = self._build_special_sample_manifest_from_metadata(
+                test_metadata,
+                final_target_cols,
+                default_window_points=raw_window_points,
+                default_step_points=500,
+            )
+
+            print(
+                "Special sampling manifests built: "
+                f"train={len(train_manifest)} | val={len(validation_manifest)} | test={len(test_manifest)}"
+            )
+
+            train_x, train_y, train_ratio, train_real_points = self._materialize_window_samples(
+                train_manifest,
+                final_target_cols,
+            )
+            val_x, val_y, val_ratio, val_real_points = self._materialize_window_samples(
+                validation_manifest,
+                final_target_cols,
+            )
+            test_x, test_y, test_ratio, test_real_points = self._materialize_window_samples(
+                test_manifest,
+                final_target_cols,
+            )
+
+            train_x, train_y, train_ratio, train_real_points = self._maybe_subsample_window_samples(
+                train_x,
+                train_y,
+                split_name="train",
+                apply_subsample=True,
+                ratio_pre_ds=train_ratio,
+                real_points=train_real_points,
+            )
+            train_x, train_y, train_ratio, train_real_points = self._apply_post_subsample_filters(
+                train_x,
+                train_y,
+                label_cols=final_target_cols,
+                split_name="train",
+                apply_filters=True,
+                ratio_pre_ds=train_ratio,
+                real_points=train_real_points,
+            )
+
+            train_x = self._maybe_downsample_window_array(train_x, "train")
+            val_x = self._maybe_downsample_window_array(val_x, "val")
+            test_x = self._maybe_downsample_window_array(test_x, "test")
+
+            train_valid_steps = self._compute_valid_steps_from_real_points(train_real_points, train_x.shape[1])
+            val_valid_steps = self._compute_valid_steps_from_real_points(val_real_points, val_x.shape[1])
+            test_valid_steps = self._compute_valid_steps_from_real_points(test_real_points, test_x.shape[1])
+
+            if self.adapt_variable_windows:
+                target_steps = int(self._window_len_after_downsample(raw_window_points))
+                train_x = self._resample_windows_by_valid_steps(train_x, train_valid_steps, target_steps)
+                val_x = self._resample_windows_by_valid_steps(val_x, val_valid_steps, target_steps)
+                test_x = self._resample_windows_by_valid_steps(test_x, test_valid_steps, target_steps)
+
+                train_valid_steps = np.full((len(train_x),), train_x.shape[1], dtype=np.int32)
+                val_valid_steps = np.full((len(val_x),), val_x.shape[1], dtype=np.int32)
+                test_valid_steps = np.full((len(test_x),), test_x.shape[1], dtype=np.int32)
+
+            train_x, val_x, test_x = self._fit_and_apply_scaler(train_x, val_x, test_x)
+            self.last_split_ratio_pre_ds = {
+                "train": train_ratio.astype(np.float32, copy=False),
+                "val": val_ratio.astype(np.float32, copy=False),
+                "test": test_ratio.astype(np.float32, copy=False),
+            }
+            self.last_split_valid_steps = {
+                "train": train_valid_steps.astype(np.int32, copy=False),
+                "val": val_valid_steps.astype(np.int32, copy=False),
+                "test": test_valid_steps.astype(np.int32, copy=False),
+            }
+            return (train_x, train_y), (val_x, val_y), (test_x, test_y), final_target_cols
 
         if self.preprocess_order == "subsample_first":
             train_seq_len = int(self.config.prep.original_freq * self.config.prep.seq_len_multiplier)
@@ -591,6 +917,11 @@ class DataHandler:
             "val": val_ratio.astype(np.float32, copy=False),
             "test": test_ratio.astype(np.float32, copy=False),
         }
+        self.last_split_valid_steps = {
+            "train": np.full((len(train_x),), train_x.shape[1], dtype=np.int32),
+            "val": np.full((len(val_x),), val_x.shape[1], dtype=np.int32),
+            "test": np.full((len(test_x),), test_x.shape[1], dtype=np.int32),
+        }
         return (train_x, train_y), (val_x, val_y), (test_x, test_y), final_target_cols
 
     def _get_data_loaders_from_sample_manifest(self):
@@ -602,28 +933,43 @@ class DataHandler:
         validation_manifest = self.data[validation_mask]
 
         final_target_cols = self._get_final_target_cols()
-        train_x, train_y, train_ratio = self._materialize_window_samples(train_manifest, final_target_cols)
-        val_x, val_y, val_ratio = self._materialize_window_samples(validation_manifest, final_target_cols)
-        test_x, test_y, test_ratio = self._materialize_window_samples(test_manifest, final_target_cols)
+        train_x, train_y, train_ratio, train_real_points = self._materialize_window_samples(
+            train_manifest,
+            final_target_cols,
+        )
+        val_x, val_y, val_ratio, val_real_points = self._materialize_window_samples(
+            validation_manifest,
+            final_target_cols,
+        )
+        test_x, test_y, test_ratio, test_real_points = self._materialize_window_samples(
+            test_manifest,
+            final_target_cols,
+        )
 
-        train_x, train_y, train_ratio = self._maybe_subsample_window_samples(
+        train_x, train_y, train_ratio, train_real_points = self._maybe_subsample_window_samples(
             train_x,
             train_y,
             split_name="train",
             apply_subsample=True,
             ratio_pre_ds=train_ratio,
+            real_points=train_real_points,
         )
-        train_x, train_y, train_ratio = self._apply_post_subsample_filters(
+        train_x, train_y, train_ratio, train_real_points = self._apply_post_subsample_filters(
             train_x,
             train_y,
             label_cols=final_target_cols,
             split_name="train",
             apply_filters=True,
             ratio_pre_ds=train_ratio,
+            real_points=train_real_points,
         )
         train_x = self._maybe_downsample_window_array(train_x, "train")
         val_x = self._maybe_downsample_window_array(val_x, "val")
         test_x = self._maybe_downsample_window_array(test_x, "test")
+
+        train_valid_steps = self._compute_valid_steps_from_real_points(train_real_points, train_x.shape[1])
+        val_valid_steps = self._compute_valid_steps_from_real_points(val_real_points, val_x.shape[1])
+        test_valid_steps = self._compute_valid_steps_from_real_points(test_real_points, test_x.shape[1])
 
         self.config.IN_CHANNELS = len(self.config.data.sensor_cols)
         train_x, val_x, test_x = self._fit_and_apply_scaler(train_x, val_x, test_x)
@@ -631,6 +977,11 @@ class DataHandler:
             "train": train_ratio.astype(np.float32, copy=False),
             "val": val_ratio.astype(np.float32, copy=False),
             "test": test_ratio.astype(np.float32, copy=False),
+        }
+        self.last_split_valid_steps = {
+            "train": train_valid_steps.astype(np.int32, copy=False),
+            "val": val_valid_steps.astype(np.int32, copy=False),
+            "test": test_valid_steps.astype(np.int32, copy=False),
         }
         return (train_x, train_y), (val_x, val_y), (test_x, test_y), final_target_cols
 
@@ -668,25 +1019,34 @@ class DataHandler:
         test_x = X[test_mask]
         test_y = y[test_mask]
         test_ratio = ratio_pre_ds_all[test_mask]
+        train_real_points = np.full((len(train_x),), train_x.shape[1], dtype=np.int32)
+        val_real_points = np.full((len(val_x),), val_x.shape[1], dtype=np.int32)
+        test_real_points = np.full((len(test_x),), test_x.shape[1], dtype=np.int32)
 
-        train_x, train_y, train_ratio = self._maybe_subsample_window_samples(
+        train_x, train_y, train_ratio, train_real_points = self._maybe_subsample_window_samples(
             train_x,
             train_y,
             split_name="train",
             apply_subsample=True,
             ratio_pre_ds=train_ratio,
+            real_points=train_real_points,
         )
-        train_x, train_y, train_ratio = self._apply_post_subsample_filters(
+        train_x, train_y, train_ratio, train_real_points = self._apply_post_subsample_filters(
             train_x,
             train_y,
             label_cols=final_target_cols,
             split_name="train",
             apply_filters=True,
             ratio_pre_ds=train_ratio,
+            real_points=train_real_points,
         )
         train_x = self._maybe_downsample_window_array(train_x, "train")
         val_x = self._maybe_downsample_window_array(val_x, "val")
         test_x = self._maybe_downsample_window_array(test_x, "test")
+
+        train_valid_steps = self._compute_valid_steps_from_real_points(train_real_points, train_x.shape[1])
+        val_valid_steps = self._compute_valid_steps_from_real_points(val_real_points, val_x.shape[1])
+        test_valid_steps = self._compute_valid_steps_from_real_points(test_real_points, test_x.shape[1])
 
         self.config.IN_CHANNELS = len(self.config.data.sensor_cols)
         train_x, val_x, test_x = self._fit_and_apply_scaler(train_x, val_x, test_x)
@@ -695,12 +1055,18 @@ class DataHandler:
             "val": val_ratio.astype(np.float32, copy=False),
             "test": test_ratio.astype(np.float32, copy=False),
         }
+        self.last_split_valid_steps = {
+            "train": train_valid_steps.astype(np.int32, copy=False),
+            "val": val_valid_steps.astype(np.int32, copy=False),
+            "test": test_valid_steps.astype(np.int32, copy=False),
+        }
         return (train_x, train_y), (val_x, val_y), (test_x, test_y), final_target_cols
 
     def get_data_loaders(self):
         print("Starting data preparation...", flush=True)
         self._source_segment_cache = {}
         self.last_split_ratio_pre_ds = {}
+        self.last_split_valid_steps = {}
 
         if self.dataset_kind == "raw":
             return self._get_data_loaders_from_raw()

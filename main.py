@@ -89,6 +89,13 @@ def print_key_run_params(args, resolved_dataset_file):
     print(f"data           : {args.data} -> {resolved_dataset_file}")
     print(f"folds          : {args.folds}")
     print(f"train_with_val : {on_off(args.train_with_val, default=True)}")
+    print(f"special_sample : {on_off(getattr(args, 'special_sampling', False), default=False)}")
+    print(
+        "special_rule   : "
+        f"window={getattr(args, 'special_window_points', 2000)}, "
+        f"step={getattr(args, 'special_step_points', 200)}"
+    )
+    print(f"adapt_var_win  : {on_off(getattr(args, 'adapt_variable_windows', True), default=True)}")
     print(f"signal_combo   : {on_off(args.signal_combo, default=True)}")
     print(f"synthetic_axes : {on_off(args.synthetic_axes, default=True)}")
     print(f"feature_engine : {on_off(args.feature_engineering, default=True)}")
@@ -185,6 +192,10 @@ def collect_selected_hparams(args):
         "random_state": getattr(args, "random_state", 42),
         "feature_domain": str(args.feature_domain).strip().lower(),
         "feature_engineering": parse_bool_arg(args.feature_engineering, default=True),
+        "special_sampling": parse_bool_arg(getattr(args, "special_sampling", False), default=False),
+        "special_window_points": int(getattr(args, "special_window_points", 2000)),
+        "special_step_points": int(getattr(args, "special_step_points", 200)),
+        "adapt_variable_windows": parse_bool_arg(getattr(args, "adapt_variable_windows", True), default=True),
         "signal_combo": parse_bool_arg(args.signal_combo, default=True),
         "synthetic_axes": parse_bool_arg(args.synthetic_axes, default=True),
         "train_with_val": parse_bool_arg(args.train_with_val, default=True),
@@ -314,6 +325,28 @@ if __name__ == "__main__":
         help="Mainline default is True: merge train+val so each fold uses 3 experiments for training and 1 for test.",
     )
     parser.add_argument(
+        "--special_sampling",
+        default=False,
+        help="Enable class-aware special window sampling on raw data. When enabled, resolved dataset is forced to the raw pickle.",
+    )
+    parser.add_argument(
+        "--special_window_points",
+        type=int,
+        default=2000,
+        help="Special sampling window size for lifting classes.",
+    )
+    parser.add_argument(
+        "--special_step_points",
+        type=int,
+        default=200,
+        help="Special sampling step size for lifting classes.",
+    )
+    parser.add_argument(
+        "--adapt_variable_windows",
+        default=True,
+        help="Length-aware resampling adaptation after special sampling to stabilize model input.",
+    )
+    parser.add_argument(
         "--train_sample_num",
         type=int,
         default=100_000,
@@ -362,7 +395,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--feature_domain",
         type=str,
-        default="time_freq",
+        default="time",
         choices=MAINLINE_FEATURE_DOMAIN_CHOICES,
         help="Feature domain: time, freq, or time_freq.",
     )
@@ -380,7 +413,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--sample_stats",
-        default=True,
+        default=False,
         help="Print and store dataset/fold label-ratio summaries.",
     )
     parser.add_argument("--random_state", type=int, default=42, help="Random seed used by model wrappers.")
@@ -434,7 +467,16 @@ if __name__ == "__main__":
     args.model = get_display_model_name(args.model)
 
     config = Config()
-    config.data.dataset_file = resolve_dataset_file(args.data)
+    resolved_dataset_file = resolve_dataset_file(args.data)
+    if parse_bool_arg(args.special_sampling, default=False):
+        raw_dataset_file = config.data.raw_dataset_file
+        if Path(resolved_dataset_file).name != Path(raw_dataset_file).name:
+            print(
+                f"[Info] special_sampling=True overrides data selection: "
+                f"{resolved_dataset_file} -> {raw_dataset_file}"
+            )
+        resolved_dataset_file = raw_dataset_file
+    config.data.dataset_file = resolved_dataset_file
     config.data.set_sensor_cols(include_synthetic_axes=parse_bool_arg(args.synthetic_axes, default=True))
 
     show_images = parse_bool_arg(args.show_images, default=False)
@@ -456,6 +498,12 @@ if __name__ == "__main__":
         n_train_data_samples=args.train_sample_num,
         preprocess_order=preprocess_order,
         single_label_only=args.single_label_only,
+        special_sampling_mode=args.special_sampling,
+        special_sampling_rules={
+            "Lifting(raising)": (int(args.special_window_points), int(args.special_step_points)),
+            "Lifting(lowering)": (int(args.special_window_points), int(args.special_step_points)),
+        },
+        adapt_variable_windows=args.adapt_variable_windows,
     )
 
     fold_previews, dataset_level_sample_stats, target_vals = collect_fold_previews(

@@ -237,7 +237,6 @@ def build_model(
             skip_drop=getattr(args, "skip_drop", None),
             min_child_samples=getattr(args, "min_child_samples", 30),
             min_data_in_leaf=getattr(args, "min_data_in_leaf", 10),
-            feature_batch_size=getattr(args, "feature_batch_size", 2000),
         )
 
     if model_key == "xgboost":
@@ -253,7 +252,6 @@ def build_model(
             reg_alpha=getattr(args, "reg_alpha", 0.0),
             reg_lambda=getattr(args, "reg_lambda", 1.0),
             early_stopping_rounds=getattr(args, "early_stopping_rounds", 100),
-            feature_batch_size=getattr(args, "feature_batch_size", 2000),
         )
 
     if model_key == "catboost":

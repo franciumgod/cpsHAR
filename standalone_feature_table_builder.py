@@ -47,19 +47,12 @@ SUPERCLASS_MAPPING = {
 }
 SUPERCLASS_LABEL_COLS = sorted(set(SUPERCLASS_MAPPING.values()))
 DEFAULT_SPECIAL_RULES = {
-    "Driving(curve)": {"window_points": 4000, "step_points": 800},
-    "Stationary processes": {"window_points": 4000, "step_points": 800},
-    "Turntable wrapping": {"window_points": 4000, "step_points": 800},
     "Lifting(raising)": {"window_points": 2000, "step_points": 200},
     "Lifting(lowering)": {"window_points": 2000, "step_points": 200},
 }
 SPECIAL_PRIORITY = [
     "Lifting(raising)",
     "Lifting(lowering)",
-    "Driving(curve)",
-    "Stationary processes",
-    "Turntable wrapping",
-    "Driving(straight)",
 ]
 RESOLUTION_SPECS = (
     ("high", RAW_FREQ),

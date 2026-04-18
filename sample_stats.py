@@ -148,6 +148,26 @@ def _build_raw_step1_dataset_stats(datahandler, class_names):
 
 def compute_dataset_label_ratio_stats(datahandler, class_names):
     if datahandler.dataset_kind == "raw":
+        if getattr(datahandler, "special_sampling_mode", False):
+            manifest_df = datahandler._build_special_sample_manifest_from_metadata(
+                datahandler.data,
+                class_names,
+                default_window_points=int(
+                    datahandler.config.prep.original_freq * datahandler.config.prep.seq_len_multiplier
+                ),
+                default_step_points=500,
+            )
+            y = manifest_df[class_names].to_numpy(dtype=np.int8, copy=False)
+            ratio_cols = [f"{name}__ratio_pre_ds" for name in class_names]
+            ratio_pre_ds = manifest_df[ratio_cols].to_numpy(dtype=np.float32, copy=False)
+            base = _build_label_ratio_stats_from_arrays(y, ratio_pre_ds, class_names)
+            return {
+                "dataset_kind": "raw_special_sampling",
+                "ratio_basis": "special class-aware windows from raw labels before downsampling",
+                "window_size": None,
+                "step_size": None,
+                **base,
+            }
         base = _build_raw_step1_dataset_stats(datahandler, class_names)
         return {
             "dataset_kind": "raw",
