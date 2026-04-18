@@ -1,96 +1,198 @@
-# 参数使用说明（简化版）
+# cpsHAR Mainline Usage
 
-这个项目参数很多，但日常训练你可以只记下面几个核心参数。
+这版 `cpsHAR` 已经收口成主线实验入口，默认思路是：
 
-## 1. 最小可用命令
+- `train_with_val=True`
+- 四折轮转里每次 `3 个实验训练 + 1 个实验测试`
+- 特征工程默认开启
+- 频域分支只开放 `RFFT`
+- 特殊信号组合开关保留
+- 额外两轴合成信号开关保留
 
-```bash
-python main.py LightGBM
-```
-
-默认会使用：
-- `data=raw`
-- `feature_engineering=False`
-- `feature_domain=time`
-- `signal_combo=False`
-- `train_with_val=False`
-
----
-
-## 2. 建议优先使用的核心参数（只记这 7 个）
-
-1. `--data`
-- 数据集选择：`raw`、`100`、`200`、`400`、`500`、自定义 pkl 文件名。
-
-2. `--feature_engineering`
-- 是否开启时域手工特征增强。`True/False`
-
-3. `--feature_domain`
-- 特征域选择：
-  - `time`：只用时域特征（默认）
-  - `freq`：只用频域特征
-  - `time_freq`：时域+频域拼接
-
-4. `--spectrum_method`
-- 当 `feature_domain` 包含 `freq` 时生效：
-  - `rfft`（默认）
-  - `welch_psd`
-  - `stft`
-  - `dwt`
-
-5. `--use_tsfresh`
-- 是否拼接 tsfresh 特征。`True/False`
-
-6. `--signal_combo`
-- 是否启用按标签的传感器组合。`True/False`
-
-7. `--train_with_val`
-- 是否将 train+val 合并用于最终训练。`True/False`
-
-8. `--output`
-- 结果输出目录（图、run_summary.json）。
-
----
-
-## 3. 常用命令模板
-
-## A. 轻量基线（推荐先跑）
+建议直接在 `conda auto` 环境里运行：
 
 ```bash
-python main.py --data 500 --feature_engineering False --feature_domain time --signal_combo False --train_with_val False --output output/baseline_500 LightGBM
+D:\Miniconda\envs\auto\python.exe main.py XGBoost
 ```
 
-## B. 时域+频域
+底层旧实现没有被硬删掉，后面如果你要把 `welch_psd / stft / dwt` 或其他扩展接回来，主要改入口和注册表就行。
+
+## 1. 最小命令
 
 ```bash
-python main.py --data 500 --feature_engineering True --feature_domain time_freq --spectrum_method welch_psd --signal_combo True --train_with_val True --output output/time_freq_500 LightGBM
+python main.py XGBoost
 ```
 
-## C. 频域 + tsfresh
+## 2. 当前主线保留的模型
+
+- `LightGBM`
+- `XGBoost`
+- `CatBoost`
+- `TabM`
+- `TabICL`
+- `RGF`
+
+说明：
+
+- `LightGBM / XGBoost / CatBoost / RGF / TabM` 已经接入主流程
+- `TabICL` 也已经接入主流程，但它依赖预训练 checkpoint
+- 当前机器上没有发现本地缓存的 `TabICL` checkpoint，所以跑 `TabICL` 时建议显式提供 `--tabicl_model_path`
+
+## 3. 主要参数
+
+- `model`
+  位置参数。模型名，例如 `LightGBM`、`XGBoost`
+
+- `--data`
+  数据集选择。可以是 `raw`、步长数字如 `200/500`，或者 `data/` 下的自定义文件名
+
+- `--output`
+  输出目录。会保存 `run_summary.json` 和混淆矩阵图
+
+- `--train_with_val`
+  默认 `True`。主线协议建议保持开启
+
+- `--signal_combo`
+  是否启用按类别定制的特殊信号组合
+
+- `--synthetic_axes`
+  是否启用两条合成轴：`Acc.norm` 和 `Gyro.norm`
+
+- `--feature_engineering`
+  是否启用当前默认手工特征工程
+
+- `--feature_domain`
+  可选：`time`、`freq`、`time_freq`
+
+- `--spectrum_method`
+  目前固定只有 `rfft`
+
+## 4. 推荐命令
+
+### XGBoost 主线
 
 ```bash
-python main.py --data 500 --feature_domain freq --spectrum_method stft --use_tsfresh True --signal_combo True --train_with_val True --output output/freq_tsfresh_500 XGBoost
+D:\Miniconda\envs\auto\python.exe main.py XGBoost ^
+  --data 500 ^
+  --feature_domain time_freq ^
+  --signal_combo True ^
+  --synthetic_axes True ^
+  --feature_engineering True ^
+  --train_with_val True ^
+  --output output/xgb_mainline
 ```
 
----
+### LightGBM 主线
 
-## 4. 与增强相关（按需加）
+```bash
+D:\Miniconda\envs\auto\python.exe main.py LightGBM ^
+  --data 500 ^
+  --feature_domain time_freq ^
+  --signal_combo True ^
+  --synthetic_axes True ^
+  --feature_engineering True ^
+  --train_with_val True ^
+  --output output/lgb_mainline
+```
 
-- `--sample_augment`：训练样本增强数量（`False/0` 关闭，`True`=1，或整数 N）
-- `--augment_method`：`jitter,scaling,rotation,mixup,cutmix,smote,basic`
-- `--augment_target`：默认 `multilabel`
-- `--tta`：测试时增强次数
-- `--tta_method`：TTA 方法，和 `augment_method` 同集合
+### CatBoost 主线
 
----
+```bash
+D:\Miniconda\envs\auto\python.exe main.py CatBoost ^
+  --data 500 ^
+  --feature_domain time_freq ^
+  --signal_combo True ^
+  --synthetic_axes True ^
+  --feature_engineering True ^
+  --train_with_val True ^
+  --output output/catboost_mainline
+```
 
-## 5. 训练日志里的关键参数打印
+### RGF 主线
 
-每次运行会自动打印以下关键配置：
-- `data`
-- `train_with_val`
-- `signal_combo`
-- `feature_engineering`
-- `feature_domain`
+```bash
+D:\Miniconda\envs\auto\python.exe main.py RGF ^
+  --data 500 ^
+  --feature_domain time_freq ^
+  --signal_combo True ^
+  --synthetic_axes True ^
+  --feature_engineering True ^
+  --train_with_val True ^
+  --output output/rgf_mainline
+```
 
-方便你确认当前实验开关状态，避免命令太长看漏。
+### TabM 主线
+
+```bash
+D:\Miniconda\envs\auto\python.exe main.py TabM ^
+  --data 500 ^
+  --feature_domain time_freq ^
+  --signal_combo True ^
+  --synthetic_axes True ^
+  --feature_engineering True ^
+  --train_with_val True ^
+  --output output/tabm_mainline
+```
+
+### TabICL 主线
+
+```bash
+D:\Miniconda\envs\auto\python.exe main.py TabICL ^
+  --data 500 ^
+  --feature_domain time_freq ^
+  --signal_combo True ^
+  --synthetic_axes True ^
+  --feature_engineering True ^
+  --train_with_val True ^
+  --tabicl_model_path path\\to\\tabicl-classifier-v2-20260212.ckpt ^
+  --output output/tabicl_mainline
+```
+
+## 5. 新模型相关参数
+
+- `--rgf_max_leaf`
+- `--rgf_algorithm`
+- `--rgf_reg_depth`
+- `--rgf_l2`
+- `--rgf_learning_rate`
+- `--rgf_min_samples_leaf`
+
+- `--tabm_max_epochs`
+- `--tabm_batch_size`
+- `--tabm_learning_rate`
+- `--tabm_weight_decay`
+- `--tabm_patience`
+- `--tabm_validation_fraction`
+- `--tabm_arch_type`
+- `--tabm_k`
+- `--tabm_d_block`
+- `--tabm_n_blocks`
+- `--tabm_dropout`
+
+- `--tabicl_n_estimators`
+- `--tabicl_batch_size`
+- `--tabicl_kv_cache`
+- `--tabicl_model_path`
+- `--tabicl_allow_auto_download`
+- `--tabicl_checkpoint_version`
+- `--tabicl_device`
+- `--tabicl_verbose`
+
+## 6. 输出内容
+
+当前默认只保留这几类图和汇总：
+
+- 每折普通混淆矩阵
+- 一个 overall 的纵向二分类混淆矩阵图
+- `run_summary.json`
+
+时间线图和每折二分类小图已经从主线输出里拿掉了。
+
+## 7. 日志顺序
+
+运行时日志分两段：
+
+1. 先统一打印四折的预览信息
+2. 再进入正式四折训练与评估
+
+这样训练前就能先看全量折信息、比例统计和样本构成，不会把预览和训练日志搅在一起。

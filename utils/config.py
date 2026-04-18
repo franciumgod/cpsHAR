@@ -7,11 +7,16 @@ from typing import List, Dict
 class DataConfig:
     dataset_file: str = f"cps_data_multi_label.pkl"
     raw_dataset_file: str = f"cps_data_multi_label.pkl"
-    sensor_cols: List[str] = field(default_factory=lambda: [
-        "Acc.x", "Acc.y", "Acc.z", "Gyro.x", "Gyro.y", "Gyro.z", "Baro.x","Acc.norm","Gyro.norm"
+    base_sensor_cols: List[str] = field(default_factory=lambda: [
+        "Acc.x", "Acc.y", "Acc.z", "Gyro.x", "Gyro.y", "Gyro.z", "Baro.x"
     ])
+    synthetic_sensor_cols: List[str] = field(default_factory=lambda: [
+        "Acc.norm", "Gyro.norm"
+    ])
+    use_synthetic_axes: bool = True
+    sensor_cols: List[str] = field(default_factory=list)
 
-    gyro_cols: List[str] = field(default_factory=lambda: ["Gyro.x", "Gyro.y", "Gyro.z","gyro.norm"])
+    gyro_cols: List[str] = field(default_factory=lambda: ["Gyro.x", "Gyro.y", "Gyro.z", "Gyro.norm"])
     test_experiment_id: int = 1
     validation_experiment_id: int = 2
 
@@ -35,6 +40,30 @@ class DataConfig:
         "Forks(entering or leaving side)": "Stationary processes",
         "Standing": "Stationary processes"
     })
+
+    def __post_init__(self):
+        if not self.sensor_cols:
+            self.sensor_cols = self.build_sensor_cols(self.use_synthetic_axes)
+
+    def build_sensor_cols(self, include_synthetic_axes=None, available_sensor_cols=None):
+        include = self.use_synthetic_axes if include_synthetic_axes is None else bool(include_synthetic_axes)
+        cols = list(self.base_sensor_cols)
+        if include:
+            cols.extend(self.synthetic_sensor_cols)
+
+        if available_sensor_cols is not None:
+            available = set(available_sensor_cols)
+            cols = [col for col in cols if col in available]
+        return cols
+
+    def set_sensor_cols(self, include_synthetic_axes=None, available_sensor_cols=None):
+        if include_synthetic_axes is not None:
+            self.use_synthetic_axes = bool(include_synthetic_axes)
+        self.sensor_cols = self.build_sensor_cols(
+            include_synthetic_axes=self.use_synthetic_axes,
+            available_sensor_cols=available_sensor_cols,
+        )
+        return list(self.sensor_cols)
 
 
 # --- 2. Preprocessing Configuration ---

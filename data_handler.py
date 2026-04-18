@@ -20,6 +20,8 @@ class DataHandler:
         downsample_window_step=20,
     ):
         self.config = config
+        self.include_synthetic_axes = bool(getattr(self.config.data, "use_synthetic_axes", True))
+        self.config.data.set_sensor_cols(include_synthetic_axes=self.include_synthetic_axes)
         self.scaler = None
         self.downsample_method = (
             str(downsample_method).lower() if downsample_method is not None else "false"
@@ -58,6 +60,15 @@ class DataHandler:
 
     def _add_new_signal(self, df):
         df = df.copy()
+        if not self.include_synthetic_axes:
+            drop_cols = [
+                col for col in getattr(self.config.data, "synthetic_sensor_cols", [])
+                if col in df.columns
+            ]
+            if drop_cols:
+                df = df.drop(columns=drop_cols, errors="ignore")
+            return df
+
         df["Acc.norm"] = np.sqrt(
             np.asarray(df["Acc.x"]) ** 2
             + np.asarray(df["Acc.y"]) ** 2
@@ -125,7 +136,10 @@ class DataHandler:
                 self.sample_manifest_meta = {k: v for k, v in payload.items() if k != "samples"}
                 self.data = payload["samples"].copy()
                 if "sensor_cols" in payload:
-                    self.config.data.sensor_cols = list(payload["sensor_cols"])
+                    self.config.data.set_sensor_cols(
+                        include_synthetic_axes=self.include_synthetic_axes,
+                        available_sensor_cols=list(payload["sensor_cols"]),
+                    )
                 source_name = self.sample_manifest_meta.get(
                     "source_dataset_file",
                     self.config.data.raw_dataset_file,
@@ -141,7 +155,10 @@ class DataHandler:
         elif self.dataset_kind == "window_samples":
             self.data = payload
             if "sensor_cols" in payload:
-                self.config.data.sensor_cols = list(payload["sensor_cols"])
+                self.config.data.set_sensor_cols(
+                    include_synthetic_axes=self.include_synthetic_axes,
+                    available_sensor_cols=list(payload["sensor_cols"]),
+                )
             print("Materialized window samples loaded.")
         else:
             self.data = payload
@@ -622,6 +639,16 @@ class DataHandler:
         X = payload["X"]
         y = payload["y"]
         experiment = payload["experiment"]
+        payload_sensor_cols = list(payload.get("sensor_cols", self.config.data.sensor_cols))
+        active_sensor_cols = self.config.data.set_sensor_cols(
+            include_synthetic_axes=self.include_synthetic_axes,
+            available_sensor_cols=payload_sensor_cols,
+        )
+        if payload_sensor_cols and len(payload_sensor_cols) == X.shape[-1]:
+            sensor_idx = {name: idx for idx, name in enumerate(payload_sensor_cols)}
+            keep_idx = [sensor_idx[name] for name in active_sensor_cols if name in sensor_idx]
+            if keep_idx and len(keep_idx) != X.shape[-1]:
+                X = X[:, :, keep_idx]
         ratio_pre_ds_all = payload.get("label_ratio_pre_ds")
         if ratio_pre_ds_all is None:
             ratio_pre_ds_all = y.astype(np.float32, copy=False)

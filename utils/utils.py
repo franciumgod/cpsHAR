@@ -1,5 +1,4 @@
 import matplotlib.pyplot as plt
-import seaborn as sns
 import numpy as np
 from pathlib import Path
 import math
@@ -13,6 +12,70 @@ from sklearn.metrics import (
     average_precision_score,
     brier_score_loss,
 )
+try:
+    import seaborn as sns
+except ImportError:  # pragma: no cover
+    sns = None
+
+def _draw_heatmap(
+    ax,
+    data,
+    annot,
+    fmt,
+    cmap,
+    xticklabels,
+    yticklabels,
+    vmin=None,
+    vmax=None,
+    cbar=False,
+    linewidths=0.0,
+    linecolor="white",
+):
+    if sns is not None:
+        return sns.heatmap(
+            data,
+            annot=annot,
+            fmt=fmt,
+            cmap=cmap,
+            ax=ax,
+            cbar=cbar,
+            xticklabels=xticklabels,
+            yticklabels=yticklabels,
+            vmin=vmin,
+            vmax=vmax,
+            linewidths=linewidths,
+            linecolor=linecolor,
+        )
+
+    im = ax.imshow(data, cmap=cmap, vmin=vmin, vmax=vmax, aspect="auto")
+    ax.set_xticks(np.arange(len(xticklabels)))
+    ax.set_xticklabels(xticklabels)
+    ax.set_yticks(np.arange(len(yticklabels)))
+    ax.set_yticklabels(yticklabels)
+
+    if isinstance(annot, (bool, np.bool_)):
+        ann_array = np.empty_like(data, dtype=object)
+        for row_idx in range(data.shape[0]):
+            for col_idx in range(data.shape[1]):
+                ann_array[row_idx, col_idx] = format(data[row_idx, col_idx], fmt)
+    else:
+        ann_array = np.asarray(annot, dtype=object)
+    for row_idx in range(data.shape[0]):
+        for col_idx in range(data.shape[1]):
+            value = ann_array[row_idx, col_idx]
+            if not isinstance(value, str):
+                value = format(data[row_idx, col_idx], fmt)
+            ax.text(col_idx, row_idx, value, ha="center", va="center", fontsize=9)
+
+    if linewidths > 0:
+        ax.set_xticks(np.arange(-0.5, data.shape[1], 1), minor=True)
+        ax.set_yticks(np.arange(-0.5, data.shape[0], 1), minor=True)
+        ax.grid(which="minor", color=linecolor, linestyle="-", linewidth=linewidths)
+        ax.tick_params(which="minor", bottom=False, left=False)
+
+    if cbar:
+        ax.figure.colorbar(im, ax=ax)
+    return im
 
 def plot_class_distribution(labels, label_names):
     counts = labels.sum(axis=0)
@@ -43,8 +106,16 @@ def plot_per_class_confusion(y_true, y_pred, class_names):
     axes = axes.flatten()
 
     for i, (cm, name) in enumerate(zip(cms, class_names)):
-        sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", ax=axes[i], cbar=False,
-                    xticklabels=["Neg", "Pos"], yticklabels=["Neg", "Pos"])
+        _draw_heatmap(
+            ax=axes[i],
+            data=cm,
+            annot=True,
+            fmt="d",
+            cmap="Blues",
+            cbar=False,
+            xticklabels=["Neg", "Pos"],
+            yticklabels=["Neg", "Pos"],
+        )
         axes[i].set_title(f"Class: {name}")
         axes[i].set_ylabel("True")
         axes[i].set_xlabel("Predicted")
@@ -60,6 +131,8 @@ def plot_per_class_binary_confusions(
     fold_label,
     save_dir="outputs/train_100W_without_val",
     show_plots=True,
+    n_cols=None,
+    file_prefix="binary_confusion",
 ):
     y_true = np.asarray(y_true)
     y_pred = np.asarray(y_pred)
@@ -74,7 +147,8 @@ def plot_per_class_binary_confusions(
     if n_classes == 0:
         return None
 
-    n_cols = min(3, max(1, n_classes))
+    n_cols = int(n_cols) if n_cols is not None else min(3, max(1, n_classes))
+    n_cols = max(1, min(n_cols, max(1, n_classes)))
     n_rows = int(math.ceil(n_classes / float(n_cols)))
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 4.2 * n_rows))
     if isinstance(axes, np.ndarray):
@@ -94,13 +168,13 @@ def plot_per_class_binary_confusions(
             ]
         )
 
-        sns.heatmap(
-            cm,
+        _draw_heatmap(
+            ax=ax,
+            data=cm,
             annot=ann,
             fmt="",
             cmap="Blues",
             cbar=False,
-            ax=ax,
             xticklabels=["Pred 0", "Pred 1"],
             yticklabels=["True 0", "True 1"],
             linewidths=0.5,
@@ -116,7 +190,7 @@ def plot_per_class_binary_confusions(
     plt.tight_layout()
     save_path = Path(save_dir)
     save_path.mkdir(parents=True, exist_ok=True)
-    out_file = save_path / f"binary_confusion_{fold_label}.png"
+    out_file = save_path / f"{file_prefix}_{fold_label}.png"
     fig.savefig(out_file, dpi=150)
     if show_plots:
         plt.show()
@@ -284,6 +358,10 @@ def plot_confusion_and_timeline(
     save_dir="outputs/train_100W_without_val",
     max_timeline_points=8000,
     show_plots=True,
+    save_timeline=True,
+    save_binary_confusion=True,
+    binary_n_cols=None,
+    binary_file_prefix="binary_confusion",
 ):
     save_path = Path(save_dir)
     save_path.mkdir(parents=True, exist_ok=True)
@@ -300,8 +378,9 @@ def plot_confusion_and_timeline(
     cm_norm = np.divide(cm, row_sums, out=np.zeros_like(cm, dtype=float), where=row_sums != 0)
 
     fig_cm, ax_cm = plt.subplots(figsize=(9, 7))
-    sns.heatmap(
-        cm_norm,
+    _draw_heatmap(
+        ax=ax_cm,
+        data=cm_norm,
         annot=True,
         fmt=".2f",
         cmap="Blues",
@@ -309,7 +388,7 @@ def plot_confusion_and_timeline(
         vmax=1.0,
         xticklabels=class_names,
         yticklabels=class_names,
-        ax=ax_cm,
+        cbar=False,
     )
     ax_cm.set_xlabel("Predicted class")
     ax_cm.set_ylabel("True class")
@@ -321,66 +400,76 @@ def plot_confusion_and_timeline(
         plt.show()
     plt.close(fig_cm)
 
-    # Timeline style plot (true vs predicted)
-    if X_for_timeline is None:
-        t = np.arange(len(y_true_idx))
-        signal = np.zeros_like(t, dtype=float)
-    else:
-        t, signal = _extract_plot_signal_from_windows(X_for_timeline)
+    tl_file = None
+    if save_timeline:
+        # Timeline style plot (true vs predicted)
+        if X_for_timeline is None:
+            t = np.arange(len(y_true_idx))
+            signal = np.zeros_like(t, dtype=float)
+        else:
+            t, signal = _extract_plot_signal_from_windows(X_for_timeline)
 
-    n = min(len(t), len(y_true_idx), len(y_pred_idx))
-    t = t[:n]
-    signal = signal[:n]
-    y_true_idx = y_true_idx[:n]
-    y_pred_idx = y_pred_idx[:n]
+        n = min(len(t), len(y_true_idx), len(y_pred_idx))
+        t = t[:n]
+        signal = signal[:n]
+        y_true_idx = y_true_idx[:n]
+        y_pred_idx = y_pred_idx[:n]
 
-    if n > max_timeline_points:
-        idx = np.linspace(0, n - 1, max_timeline_points, dtype=int)
-        t = t[idx]
-        signal = signal[idx]
-        y_true_idx = y_true_idx[idx]
-        y_pred_idx = y_pred_idx[idx]
+        if n > max_timeline_points:
+            idx = np.linspace(0, n - 1, max_timeline_points, dtype=int)
+            t = t[idx]
+            signal = signal[idx]
+            y_true_idx = y_true_idx[idx]
+            y_pred_idx = y_pred_idx[idx]
 
-    cmap = plt.get_cmap("tab10", max(10, n_classes))
-    class_colors = [cmap(i) for i in range(n_classes)]
+        cmap = plt.get_cmap("tab10", max(10, n_classes))
+        class_colors = [cmap(i) for i in range(n_classes)]
 
-    fig_tl, axes = plt.subplots(2, 1, figsize=(14, 7), sharex=True)
-    for cls in range(n_classes):
-        m_true = y_true_idx == cls
-        m_pred = y_pred_idx == cls
-        if np.any(m_true):
-            axes[0].scatter(t[m_true], signal[m_true], s=4, color=class_colors[cls], label=class_names[cls], alpha=0.9)
-        if np.any(m_pred):
-            axes[1].scatter(t[m_pred], signal[m_pred], s=4, color=class_colors[cls], label=class_names[cls], alpha=0.9)
+        fig_tl, axes = plt.subplots(2, 1, figsize=(14, 7), sharex=True)
+        for cls in range(n_classes):
+            m_true = y_true_idx == cls
+            m_pred = y_pred_idx == cls
+            if np.any(m_true):
+                axes[0].scatter(
+                    t[m_true], signal[m_true], s=4, color=class_colors[cls], label=class_names[cls], alpha=0.9
+                )
+            if np.any(m_pred):
+                axes[1].scatter(
+                    t[m_pred], signal[m_pred], s=4, color=class_colors[cls], label=class_names[cls], alpha=0.9
+                )
 
-    axes[0].set_title(f"TRUE class timeline ({fold_label})")
-    axes[1].set_title(f"PREDICTED class timeline ({fold_label})")
-    axes[0].set_ylabel("Signal")
-    axes[1].set_ylabel("Signal")
-    axes[1].set_xlabel("Sample index")
+        axes[0].set_title(f"TRUE class timeline ({fold_label})")
+        axes[1].set_title(f"PREDICTED class timeline ({fold_label})")
+        axes[0].set_ylabel("Signal")
+        axes[1].set_ylabel("Signal")
+        axes[1].set_xlabel("Sample index")
 
-    handles, labels_text = axes[1].get_legend_handles_labels()
-    uniq = dict(zip(labels_text, handles))
-    axes[1].legend(uniq.values(), uniq.keys(), loc="upper right", fontsize=8)
+        handles, labels_text = axes[1].get_legend_handles_labels()
+        uniq = dict(zip(labels_text, handles))
+        axes[1].legend(uniq.values(), uniq.keys(), loc="upper right", fontsize=8)
 
-    plt.tight_layout()
-    tl_file = save_path / f"timeline_{fold_label}.png"
-    fig_tl.savefig(tl_file, dpi=150)
-    if show_plots:
-        plt.show()
-    plt.close(fig_tl)
+        plt.tight_layout()
+        tl_file = save_path / f"timeline_{fold_label}.png"
+        fig_tl.savefig(tl_file, dpi=150)
+        if show_plots:
+            plt.show()
+        plt.close(fig_tl)
 
-    binary_cm_file = plot_per_class_binary_confusions(
-        y_true=y_true_arr,
-        y_pred=y_pred_arr,
-        class_names=class_names,
-        fold_label=fold_label,
-        save_dir=save_dir,
-        show_plots=show_plots,
-    )
+    binary_cm_file = None
+    if save_binary_confusion:
+        binary_cm_file = plot_per_class_binary_confusions(
+            y_true=y_true_arr,
+            y_pred=y_pred_arr,
+            class_names=class_names,
+            fold_label=fold_label,
+            save_dir=save_dir,
+            show_plots=show_plots,
+            n_cols=binary_n_cols,
+            file_prefix=binary_file_prefix,
+        )
 
     return {
         "confusion_path": str(cm_file),
-        "timeline_path": str(tl_file),
+        "timeline_path": str(tl_file) if tl_file is not None else None,
         "binary_confusion_path": binary_cm_file,
     }
